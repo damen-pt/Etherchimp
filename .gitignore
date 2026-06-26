@@ -1,0 +1,14 @@
+bin
+lib
+lib64
+share
+include
+*.pcap
+dist
+build
+*.key
+*.crt
+etherchimp
+*.pid
+*.log
+._*
