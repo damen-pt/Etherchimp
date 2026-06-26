@@ -3,7 +3,7 @@
 EtherChimp was created/inspired from EtherApe https://etherape.sourceforge.io/
 The tool originated from CTFs with python3 scapy scripts that was converted into a fun web interface with claude
 
-![](https://github.com/damen-pt/Etherchimp/docs/images/Etherchimp001.png)
+![](docs/images/Etherchimp001.png)
 
 Live network traffic visualizer. Etherchimp captures packets from a network
 interface (or replays a pcap), builds a real-time graph of hosts and the traffic
