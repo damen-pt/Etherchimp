@@ -25,6 +25,7 @@ force-directed map of what's talking to what on your network.
 - Go 1.24+
 - libpcap (`libpcap-dev` on Debian/Ubuntu, `libpcap` on macOS via Homebrew)
 - Root/sudo for live capture (raw socket access)
+- Etherchimp can also run in userspace 
 
 ## Build
 
@@ -47,6 +48,29 @@ Replay a capture file (no live capture, no root needed):
 ```
 
 Then open **https://localhost:8443** and accept the self-signed certificate warning.
+
+### Running in userspace (without root)
+
+Live capture does not require running Etherchimp as root. Instead of `sudo`, you
+can grant the raw-capture privilege directly to the binary (or your user) and run
+it as an unprivileged user:
+
+**Linux** — give the binary the capabilities libpcap needs:
+
+```sh
+sudo setcap cap_net_raw,cap_net_admin=eip ./etherchimp
+./etherchimp -i eth0          # now runs as a normal user
+```
+
+**macOS** — grant your user read access to the BPF devices, then run normally:
+
+```sh
+sudo chmod o+r /dev/bpf*
+./etherchimp -i en0
+```
+
+Replay mode (`-f capture.pcap`) reads from a file and never needs any of this —
+it always runs in userspace.
 
 ### Common flags
 
