@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"go-etherape/capture"
+	"etherchimp/capture"
 )
 
 // Summary-extraction regexes, compiled once at package init rather than per packet

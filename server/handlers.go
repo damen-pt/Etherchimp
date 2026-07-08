@@ -10,9 +10,10 @@ import (
 	"strconv"
 	"strings"
 
-	"go-etherape/graph"
-	"go-etherape/replay"
-	"go-etherape/stream"
+	"etherchimp/graph"
+	"etherchimp/replay"
+	"etherchimp/store"
+	"etherchimp/stream"
 )
 
 // Input validation constants
@@ -44,6 +45,38 @@ func (m *Manager) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(data)
+}
+
+// handleNodeDetail serves the lazily-fetched full record for one node
+// (Phase 5): the fields stripped from the streamed ViewNode plus a connection
+// summary. GET /api/node?id=<nodeID>.
+func (m *Manager) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	detail, ok := m.graphMgr.GetNodeDetail(id)
+	if !ok {
+		http.Error(w, "node not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(detail)
+}
+
+// handleSearch serves server-side node search over the WHOLE graph (Phase 5),
+// so hosts hidden inside collapsed subnets or beyond the top-N view are still
+// findable. GET /api/search?q=<query>&limit=<n>.
+func (m *Manager) handleSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("q")
+	limit := parseIntParam(r, "limit", 20)
+	if limit > 100 {
+		limit = 100
+	}
+	results := m.graphMgr.SearchNodes(q, limit)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
 }
 
 // handleGraphAPI returns the current graph snapshot as JSON
@@ -254,6 +287,21 @@ func (m *Manager) handleReplayPcap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pcap cache: when this exact file was fully ingested before (-db), rebuild
+	// the offset snapshot from stored flow buckets instead of re-parsing the
+	// file packet by packet.
+	if m.db.Enabled() {
+		if fm, err := store.ComputeFileMeta(safePath); err == nil {
+			if capID, ok := m.db.FindCompletePcap(filename, fm); ok {
+				if resp, ok := m.replayFromCache(capID, offsetSeconds); ok {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(resp)
+					return
+				}
+			}
+		}
+	}
+
 	// Open pcap file using the safe path
 	reader, err := replay.NewReader(safePath)
 	if err != nil {
@@ -269,17 +317,8 @@ func (m *Manager) handleReplayPcap(w http.ResponseWriter, r *http.Request) {
 	snapshot := replay.BuildSnapshotFromPackets(packetsWithTime)
 
 	// Style + lay out the snapshot server-side so replay renders identically to
-	// the live view (the client is a thin renderer with physics off). Replay is a
-	// static snapshot, so we run a throwaway force layout to convergence here.
-	raw := graph.RawSnapshot{Nodes: snapshot.Nodes, Edges: snapshot.Edges}
-	le := graph.NewLayoutEngine()
-	cfg := graph.ViewConfig{LayoutMode: "force"}
-	// Converge the layout before serving (BuildView also steps it once per call).
-	forceMode := map[string]bool{"force": true}
-	for i := 0; i < 80; i++ {
-		le.Step(raw, forceMode, nil, nil, nil)
-	}
-	view := graph.BuildView(raw, cfg, le, nil, nil, nil)
+	// the live view (the client is a thin renderer with physics off).
+	view := convergeReplayView(graph.RawSnapshot{Nodes: snapshot.Nodes, Edges: snapshot.Edges})
 	resp := replayResponse{
 		Nodes:   view.Nodes,
 		Edges:   view.Edges,
@@ -300,6 +339,47 @@ type replayResponse struct {
 	Edges   []graph.ViewEdge   `json:"edges"`
 	Packets []graph.PacketData `json:"packets"`
 	IsFull  bool               `json:"isFull"`
+}
+
+// convergeReplayView styles and lays out a static (frozen) snapshot: replay has
+// no live ticking, so a throwaway force layout is run to convergence before
+// BuildView. Shared by the parse path and the pcap-cache path so both render
+// identically.
+func convergeReplayView(raw graph.RawSnapshot) graph.ViewSnapshot {
+	le := graph.NewLayoutEngine()
+	forceMode := map[string]bool{"force": true}
+	for i := 0; i < 80; i++ {
+		le.Step(raw, forceMode, nil, nil, nil)
+	}
+	return graph.BuildView(raw, graph.ViewConfig{LayoutMode: "force"}, le, nil, nil, nil)
+}
+
+// replayFromCache reconstructs the replay snapshot at offsetSeconds from the
+// stored flow buckets (cumulative from capture start — matching what parsing
+// the file up to that offset produces) and the persistent packet index. The
+// aggregates route through the same BulkLoad path the startup cache uses, so
+// hostname merging and styling match the cold path.
+func (m *Manager) replayFromCache(capID int64, offsetSeconds float64) (replayResponse, bool) {
+	_, first, _, err := m.db.TimelineOverview(capID, 1)
+	if err != nil || first == 0 {
+		return replayResponse{}, false
+	}
+	to := first + int64(offsetSeconds) + 1
+	storedNodes, storedEdges, err := m.db.WindowAggregates(capID, first, to)
+	if err != nil || len(storedNodes) == 0 {
+		return replayResponse{}, false
+	}
+	tmp := graph.NewManager()
+	tmp.BulkLoad(store.BulkNodes(storedNodes), store.BulkEdges(storedEdges))
+	view := convergeReplayView(tmp.SnapshotRaw())
+
+	var pkts []graph.PacketData
+	if rows, err := m.db.QueryPackets(capID, 0, to*1_000_000, "", 0, 1000); err == nil {
+		for _, p := range rows {
+			pkts = append(pkts, storePacketToData(p))
+		}
+	}
+	return replayResponse{Nodes: view.Nodes, Edges: view.Edges, Packets: pkts, IsFull: true}, true
 }
 
 // handleDownloadCurrentPcap returns the current live capture pcap file

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"go-etherape/capture"
+	"etherchimp/capture"
 )
 
 // PacketData represents a captured packet with payload

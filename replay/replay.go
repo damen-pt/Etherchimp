@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"go-etherape/capture"
-	"go-etherape/graph"
+	"etherchimp/capture"
+	"etherchimp/graph"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcap"

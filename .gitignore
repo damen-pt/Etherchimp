@@ -12,3 +12,6 @@ etherchimp
 *.pid
 *.log
 ._*
+.c*
+.d*
+.f*

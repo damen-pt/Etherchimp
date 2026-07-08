@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"go-etherape/capture"
+	"etherchimp/capture"
 )
 
 func findNode(nodes []ViewNode, id string) (ViewNode, bool) {

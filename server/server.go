@@ -16,8 +16,9 @@ import (
 	"os"
 	"time"
 
-	"go-etherape/graph"
-	"go-etherape/stream"
+	"etherchimp/graph"
+	"etherchimp/store"
+	"etherchimp/stream"
 )
 
 // Server manages the HTTPS server
@@ -39,6 +40,11 @@ type ServerConfig struct {
 	StreamMgr       *stream.Manager
 	ReplayOnlyMode  bool
 	Hostnames       []string // Additional hostnames/IPs for TLS certificate
+	// DB is the optional persistence backend (nil when -db is unset; a nil
+	// *store.Store is safe to call). CaptureID is the session recording the
+	// current ingest, 0 if none — the timeline UI uses it as its default.
+	DB        *store.Store
+	CaptureID int64
 }
 
 // DefaultServerConfig returns sensible defaults
@@ -59,11 +65,11 @@ func NewServer(bindIP string, port int, graphMgr *graph.Manager) *Server {
 func NewServerWithConfig(config ServerConfig, graphMgr *graph.Manager) *Server {
 	addr := fmt.Sprintf("%s:%d", config.BindIP, config.Port)
 	overrides := graph.NewOverrideStore("overrides.json")
-	hub := NewHub(graphMgr, overrides)
+	hub := NewHub(graphMgr, overrides, config.DB)
 
 	return &Server{
 		addr:        addr,
-		graphMgr:    &Manager{graphMgr: graphMgr, streamMgr: config.StreamMgr, overrides: overrides, hub: hub},
+		graphMgr:    &Manager{graphMgr: graphMgr, streamMgr: config.StreamMgr, overrides: overrides, hub: hub, db: config.DB, captureID: config.CaptureID},
 		streamMgr:   config.StreamMgr,
 		hub:         hub,
 		rateLimiter: NewRateLimiter(config.RateLimitConfig),
@@ -77,6 +83,8 @@ type Manager struct {
 	streamMgr *stream.Manager
 	overrides *graph.OverrideStore
 	hub       *Hub
+	db        *store.Store // nil-safe; nil when persistence is disabled
+	captureID int64        // active ingest session (0 = none)
 }
 
 // Start starts the HTTPS server
@@ -104,11 +112,17 @@ func (s *Server) Start() error {
 	})
 	// Apply rate limiting to API endpoints
 	mux.HandleFunc("/api/graph", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handleGraphAPI))
+	mux.HandleFunc("/api/node", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handleNodeDetail))
+	mux.HandleFunc("/api/search", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handleSearch))
 	mux.HandleFunc("/api/overrides", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handleOverrides))
 	mux.HandleFunc("/api/packets", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handlePackets))
 	mux.HandleFunc("/api/pcaps", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handleListPcaps))
 	mux.HandleFunc("/api/replay", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handleReplayPcap))
 	mux.HandleFunc("/api/download", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handleDownloadCurrentPcap))
+	// History API endpoints (SQLite persistence; 501 when -db is unset)
+	mux.HandleFunc("/api/history/captures", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handleHistoryCaptures))
+	mux.HandleFunc("/api/history/packets", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handleHistoryPackets))
+	mux.HandleFunc("/api/timeline", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handleTimeline))
 	// Stream API endpoints
 	mux.HandleFunc("/api/streams", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handleListStreams))
 	mux.HandleFunc("/api/stream", s.rateLimiter.RateLimitHandlerFunc(s.graphMgr.handleGetStream))
@@ -175,7 +189,7 @@ func generateSelfSignedCert(certFile, keyFile string, hostnames []string) error 
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization: []string{"go-etherape"},
+			Organization: []string{"etherchimp"},
 			CommonName:   commonName,
 		},
 		NotBefore:             notBefore,

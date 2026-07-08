@@ -2,11 +2,12 @@ package graph
 
 import (
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"go-etherape/capture"
+	"etherchimp/capture"
 )
 
 // Node represents a network node (IP address)
@@ -109,12 +110,27 @@ type Edge struct {
 	ReverseBytes   int64 `json:"reverseBytes"`
 }
 
+// EdgeIDSep joins the two endpoint IDs of a canonical edge ID. The store
+// persists edge IDs verbatim, so anything that builds or parses one must go
+// through getCanonicalEdgeID / SplitEdgeID rather than hand-rolling the format.
+const EdgeIDSep = "<->"
+
 // getCanonicalEdgeID returns a consistent edge ID regardless of direction
 func getCanonicalEdgeID(nodeA, nodeB string) (edgeID, from, to string) {
 	if nodeA < nodeB {
-		return nodeA + "<->" + nodeB, nodeA, nodeB
+		return nodeA + EdgeIDSep + nodeB, nodeA, nodeB
 	}
-	return nodeB + "<->" + nodeA, nodeB, nodeA
+	return nodeB + EdgeIDSep + nodeA, nodeB, nodeA
+}
+
+// SplitEdgeID parses a canonical edge ID back into its endpoints. Node IDs can
+// themselves contain the separator's characters, so it splits on the FIRST
+// occurrence, matching how getCanonicalEdgeID joined them.
+func SplitEdgeID(id string) (from, to string, ok bool) {
+	if i := strings.Index(id, EdgeIDSep); i > 0 && i+len(EdgeIDSep) < len(id) {
+		return id[:i], id[i+len(EdgeIDSep):], true
+	}
+	return "", "", false
 }
 
 // TrafficFlow represents recent per-edge traffic for real-time visualization
@@ -201,7 +217,11 @@ func (m *Manager) ClearDirty() {
 func (m *Manager) AddOrUpdateNode(ip, hostname string, bytes int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.addOrUpdateNodeLocked(ip, hostname, bytes)
+}
 
+// addOrUpdateNodeLocked is AddOrUpdateNode's body; caller holds m.mu.
+func (m *Manager) addOrUpdateNodeLocked(ip, hostname string, bytes int) {
 	m.dirty = true
 
 	// Group (multicast/broadcast) addresses get a stable, friendly label instead
@@ -385,7 +405,10 @@ func (m *Manager) AddOrUpdateNode(ip, hostname string, bytes int) {
 func (m *Manager) AddPortObservation(srcIP, dstIP string, srcPort, dstPort uint16) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.addPortObservationLocked(srcIP, dstIP, srcPort, dstPort)
+}
 
+func (m *Manager) addPortObservationLocked(srcIP, dstIP string, srcPort, dstPort uint16) {
 	srcID := m.ipToNodeID[srcIP]
 	dstID := m.ipToNodeID[dstIP]
 	src := m.nodes[srcID]
@@ -393,12 +416,6 @@ func (m *Manager) AddPortObservation(srcIP, dstIP string, srcPort, dstPort uint1
 
 	if src != nil {
 		src.OutPackets++
-		if dst != nil && srcID != dstID {
-			if src.Peers == nil {
-				src.Peers = make(map[string]struct{})
-			}
-			src.Peers[dstID] = struct{}{}
-		}
 	}
 	if dst != nil {
 		dst.InPackets++
@@ -409,20 +426,38 @@ func (m *Manager) AddPortObservation(srcIP, dstIP string, srcPort, dstPort uint1
 			}
 			dst.ListenPorts[dstPort]++
 		}
-		if src != nil && srcID != dstID {
-			if dst.Peers == nil {
-				dst.Peers = make(map[string]struct{})
-			}
-			dst.Peers[srcID] = struct{}{}
-		}
 	}
+}
+
+// addPeersLocked records the two endpoints of an edge as each other's peers.
+// Lives on the edge path (not the port-observation path) so every ingest route
+// — live packets, synthetic traffic, bulk loads — maintains the peer sets.
+func (m *Manager) addPeersLocked(aID, bID string) {
+	if aID == bID {
+		return
+	}
+	a, b := m.nodes[aID], m.nodes[bID]
+	if a == nil || b == nil {
+		return
+	}
+	if a.Peers == nil {
+		a.Peers = make(map[string]struct{})
+	}
+	a.Peers[bID] = struct{}{}
+	if b.Peers == nil {
+		b.Peers = make(map[string]struct{})
+	}
+	b.Peers[aID] = struct{}{}
 }
 
 // AddOrUpdateEdge adds a new edge or updates an existing one (bidirectional)
 func (m *Manager) AddOrUpdateEdge(srcIP, dstIP string, protocol capture.Protocol, bytes int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.addOrUpdateEdgeLocked(srcIP, dstIP, protocol, bytes)
+}
 
+func (m *Manager) addOrUpdateEdgeLocked(srcIP, dstIP string, protocol capture.Protocol, bytes int) {
 	m.dirty = true
 	// Called once per (graphed) packet, so this is an accurate per-protocol total
 	// even for multi-protocol node pairs that collapse to one edge.
@@ -442,6 +477,8 @@ func (m *Manager) AddOrUpdateEdge(srcIP, dstIP string, protocol capture.Protocol
 	// Use canonical edge ID for bidirectional edges
 	edgeID, canonicalFrom, canonicalTo := getCanonicalEdgeID(srcNodeID, dstNodeID)
 	isForward := srcNodeID == canonicalFrom // true if packet flows From -> To
+
+	m.addPeersLocked(canonicalFrom, canonicalTo)
 
 	edge, exists := m.edges[edgeID]
 
@@ -644,19 +681,43 @@ func (m *Manager) AddPacket(pkt *capture.PacketInfo) {
 	m.packetStore.AddPacket(pkt)
 	m.mu.Lock()
 	m.dirty = true
-	// LLDP/CDP frames carry network-device identity; stamp it on the source node
-	// (already created earlier in the packet-processing order) for the hardware map.
-	if pkt.DeviceKind != "" {
-		if id, ok := m.ipToNodeID[pkt.SrcIP]; ok {
-			if n := m.nodes[id]; n != nil {
-				n.DeviceKind = pkt.DeviceKind
-				if pkt.DeviceInfo != "" {
-					n.DeviceInfo = pkt.DeviceInfo
-				}
+	m.stampDeviceInfoLocked(pkt)
+	m.mu.Unlock()
+}
+
+// stampDeviceInfoLocked applies LLDP/CDP device identity carried on a packet to
+// its source node (already created earlier in the packet-processing order) for
+// the hardware map. Caller holds m.mu.
+func (m *Manager) stampDeviceInfoLocked(pkt *capture.PacketInfo) {
+	if pkt.DeviceKind == "" {
+		return
+	}
+	if id, ok := m.ipToNodeID[pkt.SrcIP]; ok {
+		if n := m.nodes[id]; n != nil {
+			n.DeviceKind = pkt.DeviceKind
+			if pkt.DeviceInfo != "" {
+				n.DeviceInfo = pkt.DeviceInfo
 			}
 		}
 	}
-	m.mu.Unlock()
+}
+
+// Ingest applies one packet's complete graph update — both endpoint nodes, the
+// edge, port/peer observations, device identity, and the packet-store append —
+// under a single acquisition of the manager lock. This is the hot ingest path:
+// the discrete AddOrUpdateNode/AddOrUpdateEdge/AddPortObservation/AddPacket
+// calls it replaces took the same write lock five times per packet.
+func (m *Manager) Ingest(pkt *capture.PacketInfo, srcHostname, dstHostname string) {
+	m.packetStore.AddPacket(pkt) // has its own lock
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dirty = true
+	m.addOrUpdateNodeLocked(pkt.SrcIP, srcHostname, pkt.Length)
+	m.addOrUpdateNodeLocked(pkt.DstIP, dstHostname, pkt.Length)
+	m.addOrUpdateEdgeLocked(pkt.SrcIP, pkt.DstIP, pkt.Protocol, pkt.Length)
+	m.addPortObservationLocked(pkt.SrcIP, pkt.DstIP, pkt.SrcPort, pkt.DstPort)
+	m.stampDeviceInfoLocked(pkt)
 }
 
 // RemoveStaleNodes removes nodes that haven't been seen recently
@@ -728,6 +789,156 @@ func (m *Manager) RemoveStaleEdges(threshold time.Duration) int {
 	return len(staleEdgeIDs)
 }
 
+// NodeDetail is the full lazily-fetched record for one node (Phase 5): the
+// fields stripped from the streamed ViewNode plus a connection summary. Served
+// by GET /api/node?id=.
+type NodeDetail struct {
+	ID          string           `json:"id"`
+	Label       string           `json:"label"`
+	IPs         []string         `json:"ips,omitempty"`
+	Role        string           `json:"role,omitempty"`
+	Icon        string           `json:"icon,omitempty"`
+	DeviceInfo  string           `json:"deviceInfo,omitempty"`
+	PacketCount int              `json:"packetCount"`
+	ByteCount   int64            `json:"byteCount"`
+	IsGroup     bool             `json:"isGroup,omitempty"`
+	LastSeen    time.Time        `json:"lastSeen"`
+	Peers       int              `json:"peers"` // distinct peer count (full graph)
+	Edges       []NodeDetailEdge `json:"edges,omitempty"`
+}
+
+// NodeDetailEdge summarizes one connection of a node for the detail panel.
+type NodeDetailEdge struct {
+	Peer        string `json:"peer"`
+	Protocol    string `json:"protocol"`
+	Color       string `json:"color"`
+	PacketCount int    `json:"packetCount"`
+	ByteCount   int64  `json:"byteCount"`
+	Outbound    bool   `json:"outbound"` // this node is the edge's From
+}
+
+// GetNodeDetail returns the full record for one node, or false when unknown.
+// Edge summaries are capped so a datacenter hub doesn't return megabytes.
+func (m *Manager) GetNodeDetail(id string) (NodeDetail, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	n, ok := m.nodes[id]
+	if !ok {
+		return NodeDetail{}, false
+	}
+	role, icon := classifyNode(n)
+	label := n.Hostname
+	if label == "" {
+		label = id
+	}
+	d := NodeDetail{
+		ID:          id,
+		Label:       label,
+		IPs:         append([]string(nil), n.IPs...),
+		Role:        role,
+		Icon:        icon,
+		DeviceInfo:  n.DeviceInfo,
+		PacketCount: n.PacketCount,
+		ByteCount:   n.ByteCount,
+		IsGroup:     n.IsGroup,
+		LastSeen:    n.LastSeen,
+		Peers:       len(n.Peers),
+	}
+	const maxDetailEdges = 100
+	for _, e := range m.edges {
+		if e.From != id && e.To != id {
+			continue
+		}
+		peer := e.To
+		out := true
+		if e.To == id {
+			peer = e.From
+			out = false
+		}
+		d.Edges = append(d.Edges, NodeDetailEdge{
+			Peer:        peer,
+			Protocol:    e.Protocol.Name,
+			Color:       e.Protocol.Color,
+			PacketCount: e.PacketCount,
+			ByteCount:   e.ByteCount,
+			Outbound:    out,
+		})
+	}
+	// Sort BEFORE capping so a >100-edge hub returns its busiest connections,
+	// not an arbitrary map-order subset.
+	sort.Slice(d.Edges, func(a, b int) bool { return d.Edges[a].PacketCount > d.Edges[b].PacketCount })
+	if len(d.Edges) > maxDetailEdges {
+		d.Edges = d.Edges[:maxDetailEdges]
+	}
+	return d, true
+}
+
+// SearchResult is one match from SearchNodes (Phase 5 server-side search over
+// the WHOLE graph, not just a client's rendered view).
+type SearchResult struct {
+	ID          string   `json:"id"`
+	Label       string   `json:"label"`
+	IPs         []string `json:"ips,omitempty"`
+	PacketCount int      `json:"packetCount"`
+	ByteCount   int64    `json:"byteCount"`
+	Subnet24    string   `json:"subnet24,omitempty"` // CIDR chain for un-collapsing
+	Subnet16    string   `json:"subnet16,omitempty"`
+}
+
+// SearchNodes returns up to limit nodes whose ID, hostname or any IP contains
+// the query (case-insensitive), busiest first.
+func (m *Manager) SearchNodes(query string, limit int) []SearchResult {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return nil
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []SearchResult
+	for id, n := range m.nodes {
+		match := strings.Contains(strings.ToLower(id), q) ||
+			strings.Contains(strings.ToLower(n.Hostname), q)
+		if !match {
+			for _, ip := range n.IPs {
+				if strings.Contains(strings.ToLower(ip), q) {
+					match = true
+					break
+				}
+			}
+		}
+		if !match {
+			continue
+		}
+		r := SearchResult{
+			ID:          id,
+			Label:       n.Hostname,
+			IPs:         append([]string(nil), n.IPs...),
+			PacketCount: n.PacketCount,
+			ByteCount:   n.ByteCount,
+		}
+		if s := primarySubnet24(*n); s != "" {
+			r.Subnet24 = s + ".0/24"
+			if dot := strings.LastIndexByte(s, '.'); dot > 0 {
+				r.Subnet16 = s[:dot] + ".0.0/16"
+			}
+		}
+		out = append(out, r)
+	}
+	sort.Slice(out, func(a, b int) bool {
+		if out[a].PacketCount != out[b].PacketCount {
+			return out[a].PacketCount > out[b].PacketCount
+		}
+		return out[a].ID < out[b].ID
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 // GetNodeCount returns the current number of nodes
 func (m *Manager) GetNodeCount() int {
 	m.mu.RLock()
@@ -754,4 +965,125 @@ func (m *Manager) Clear() {
 	m.packetStore = NewPacketStore(1000)
 	m.recentFlows = make(map[flowKey]*TrafficFlow)
 	m.dirty = true
+}
+
+// BulkNode / BulkEdge are pre-aggregated rows from the persistence layer
+// (store package), replayed into the graph in one shot on a pcap cache hit.
+// IDs are raw endpoint ids as captured; BulkLoad re-runs the same hostname
+// merging and group classification the packet path would have.
+type BulkNode struct {
+	ID          string
+	Hostname    string
+	PacketCount int64
+	ByteCount   int64
+}
+
+type BulkEdge struct {
+	From, To       string
+	Protocol       string // protocol name; resolved against capture.GetAllProtocols
+	PacketCount    int64
+	ByteCount      int64
+	ForwardPackets int64
+	ReversePackets int64
+	ForwardBytes   int64
+	ReverseBytes   int64
+}
+
+// BulkLoad populates the graph from stored aggregates. Nodes route through
+// AddOrUpdateNode so IP->hostname merging and group labels behave exactly as
+// on the packet path; counters are then overwritten with the stored totals
+// (AddOrUpdateNode counted a fake packet per row). LastSeen is "now", matching
+// what a cold replay run would produce when it loads a file at startup.
+func (m *Manager) BulkLoad(nodes []BulkNode, edges []BulkEdge) {
+	for _, n := range nodes {
+		m.AddOrUpdateNode(n.ID, n.Hostname, 0)
+	}
+
+	protoByName := make(map[string]capture.Protocol)
+	for _, p := range capture.GetAllProtocols() {
+		protoByName[p.Name] = p
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dirty = true
+
+	// Overwrite counters. Several raw IPs may have merged into one node, so
+	// zero each target once, then accumulate.
+	zeroed := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		id, ok := m.ipToNodeID[n.ID]
+		if !ok {
+			id = n.ID
+		}
+		node := m.nodes[id]
+		if node == nil {
+			continue
+		}
+		if !zeroed[id] {
+			node.PacketCount = 0
+			node.ByteCount = 0
+			zeroed[id] = true
+		}
+		node.PacketCount += int(n.PacketCount)
+		node.ByteCount += n.ByteCount
+	}
+
+	for _, e := range edges {
+		// A genuine self-loop (src==dst in the capture) is kept — the packet
+		// path creates those too. One that only appears after IP->hostname
+		// mapping is a merge artifact, which the packet path deletes.
+		genuineSelfLoop := e.From == e.To
+		from, to := e.From, e.To
+		if id, ok := m.ipToNodeID[from]; ok {
+			from = id
+		}
+		if id, ok := m.ipToNodeID[to]; ok {
+			to = id
+		}
+		if from == to && !genuineSelfLoop {
+			continue
+		}
+		proto, ok := protoByName[e.Protocol]
+		if !ok {
+			proto = capture.Protocol{Name: e.Protocol, Color: "#95a5a6", Layer: capture.LayerTransport, LayerNum: 4}
+		}
+		edgeID, canonicalFrom, canonicalTo := getCanonicalEdgeID(from, to)
+		// Derive peer sets from the edges (stored aggregates have no per-packet
+		// data) or GetNodeDetail would report 0 peers for loaded graphs.
+		m.addPeersLocked(canonicalFrom, canonicalTo)
+		// Stored fwd/rev are relative to the stored canonical order; if merging
+		// flipped the endpoints, swap the directional splits to match.
+		fwdP, revP, fwdB, revB := e.ForwardPackets, e.ReversePackets, e.ForwardBytes, e.ReverseBytes
+		if canonicalFrom != from {
+			fwdP, revP, fwdB, revB = revP, fwdP, revB, fwdB
+		}
+		if edge, exists := m.edges[edgeID]; exists {
+			edge.PacketCount += int(e.PacketCount)
+			edge.ByteCount += e.ByteCount
+			edge.ForwardPackets += int(fwdP)
+			edge.ReversePackets += int(revP)
+			edge.ForwardBytes += fwdB
+			edge.ReverseBytes += revB
+			edge.LastSeen = time.Now()
+			if proto.Name != "TCP" && proto.Name != "UDP" {
+				edge.Protocol = proto
+			}
+		} else {
+			m.edges[edgeID] = &Edge{
+				ID:             edgeID,
+				From:           canonicalFrom,
+				To:             canonicalTo,
+				Protocol:       proto,
+				PacketCount:    int(e.PacketCount),
+				ByteCount:      e.ByteCount,
+				LastSeen:       time.Now(),
+				ForwardPackets: int(fwdP),
+				ReversePackets: int(revP),
+				ForwardBytes:   fwdB,
+				ReverseBytes:   revB,
+			}
+		}
+		m.protoCounts[e.Protocol] += int(e.PacketCount)
+	}
 }
