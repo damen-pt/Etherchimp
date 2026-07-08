@@ -1,0 +1,90 @@
+name: Release
+
+# Builds release tarballs for every push of a v* tag (e.g. v0.1.0) and
+# attaches them to a GitHub release for that tag.
+#
+# etherchimp uses cgo (go-sqlite3 bundles SQLite; gopacket links libpcap), so
+# each target is built on a runner of its own architecture instead of
+# cross-compiling — except darwin/amd64, which Apple clang can cross-target
+# from an arm64 runner. Linux runners need libpcap headers at build time;
+# Linux *users* need the libpcap runtime package (macOS ships it).
+#
+# NOTE: ubuntu-*-arm runners are free for public repos only. For a private
+# repo, either pay for hosted arm runners or cross-compile linux/arm64 on
+# ubuntu-latest with gcc-aarch64-linux-gnu + libpcap-dev:arm64 (multiarch).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload assets
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - runner: macos-15 # Apple Silicon
+            goos: darwin
+            goarch: arm64
+          - runner: macos-15 # cross-target x86_64 via clang -arch
+            goos: darwin
+            goarch: amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install libpcap headers (Linux)
+        if: matrix.goos == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          if [ "${{ matrix.goos }}" = "darwin" ] && [ "${{ matrix.goarch }}" = "amd64" ]; then
+            export CC="clang -arch x86_64"
+          fi
+          go build -trimpath -ldflags "-s -w" -o etherchimp .
+
+      # The server serves static/index.html and /static/* from disk, so a
+      # release must ship the static tree alongside the binary.
+      - name: Package
+        run: |
+          pkg="etherchimp-${GITHUB_REF_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir "$pkg"
+          cp etherchimp "$pkg/"
+          cp -R static "$pkg/static"
+          tar czf "$pkg.tar.gz" "$pkg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: etherchimp-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: etherchimp-*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
