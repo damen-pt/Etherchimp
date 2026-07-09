@@ -115,7 +115,12 @@ jobs:
           CGO_ENABLED: "1"
           GOOS: linux
           GOARCH: amd64
-        run: go build -trimpath -ldflags "-s -w" -o etherchimp .
+        # The checkout is owned by a different user than the container's, so
+        # git's dubious-ownership guard blocks go's VCS stamping (exit 128).
+        # Mark the workspace safe so the revision stamp still lands.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          go build -trimpath -ldflags "-s -w" -o etherchimp .
 
       - name: Package
         run: |
