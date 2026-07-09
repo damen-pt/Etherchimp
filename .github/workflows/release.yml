@@ -87,8 +87,49 @@ jobs:
           name: etherchimp-${{ matrix.goos }}-${{ matrix.goarch }}
           path: etherchimp-*.tar.gz
 
+  # RHEL/Fedora-family build. The matrix jobs above run on Ubuntu, so their
+  # binaries record libpcap's Debian SONAME (libpcap.so.0.8), which RHEL/Rocky/
+  # Fedora don't ship — those provide libpcap.so.1. Building inside a Rocky 9
+  # container makes -lpcap resolve against libpcap.so.1, so the artifact runs on
+  # el9 (RHEL/Rocky/Alma/Fedora 9.x+) out of the box. The runner is still
+  # Ubuntu; only these steps execute in the container. glibc 2.34 here means the
+  # binary needs el9-or-newer, not el8.
+  build-el9:
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    steps:
+      - name: Install build deps
+        run: dnf install -y gcc make tar gzip git libpcap-devel
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: amd64
+        run: go build -trimpath -ldflags "-s -w" -o etherchimp .
+
+      - name: Package
+        run: |
+          pkg="etherchimp-${GITHUB_REF_NAME}-linux-amd64-el9"
+          mkdir "$pkg"
+          cp etherchimp "$pkg/"
+          cp -R static "$pkg/static"
+          tar czf "$pkg.tar.gz" "$pkg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: etherchimp-linux-amd64-el9
+          path: etherchimp-*.tar.gz
+
   release:
-    needs: build
+    needs: [build, build-el9]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
