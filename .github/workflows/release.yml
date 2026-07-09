@@ -100,7 +100,9 @@ jobs:
       image: rockylinux:9
     steps:
       - name: Install build deps
-        run: dnf install -y gcc make tar gzip git libpcap-devel
+        # libpcap-devel lives in the CRB repo (CodeReady Builder), disabled by
+        # default on el9; enable it just for this install.
+        run: dnf install -y --enablerepo=crb gcc make tar gzip git libpcap-devel
 
       - uses: actions/checkout@v4
 
