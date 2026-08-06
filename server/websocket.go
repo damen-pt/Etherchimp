@@ -7,7 +7,6 @@ import (
 	"math"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -110,6 +109,79 @@ const (
 	viewRebuildEveryLarge = 5
 )
 
+// Adaptive tick pacing: the hub's tick cadence follows the smoothed tick cost
+// (Hub.tickEMA) so a traffic burst stretches the update rate (2–5Hz) instead of
+// letting a monolithic tick run permanently late at a pinned 10Hz.
+const (
+	// tickIntervalFast is the full real-time cadence while ticks are cheap.
+	tickIntervalFast = 100 * time.Millisecond
+	// tickIntervalBusy is used once the tick EMA crosses tickEMAMedium.
+	tickIntervalBusy = 200 * time.Millisecond
+	// tickIntervalMax is the ceiling past tickEMAHigh — the hub keeps updating
+	// through a burst at 2Hz instead of degrading into late 10Hz ticks.
+	tickIntervalMax = 500 * time.Millisecond
+
+	// tickEMAMedium and tickEMAHigh are the tick-cost EMA thresholds selecting
+	// the busy and max cadences respectively (see pacingBand).
+	tickEMAMedium = 50 * time.Millisecond
+	tickEMAHigh   = 80 * time.Millisecond
+
+	// pacingHysteresis: the EMA must hold in a LOWER band for this long before
+	// the cadence steps back down, so the rate doesn't oscillate around a
+	// threshold. Step-ups are immediate (latency protection), step-downs patient.
+	pacingHysteresis = 2 * time.Second
+)
+
+// pacingBand maps a tick-cost EMA to the cadence it calls for, before any
+// hysteresis: <50ms → fast, 50–80ms → busy, >80ms → max.
+func pacingBand(ema time.Duration) time.Duration {
+	switch {
+	case ema > tickEMAHigh:
+		return tickIntervalMax
+	case ema >= tickEMAMedium:
+		return tickIntervalBusy
+	default:
+		return tickIntervalFast
+	}
+}
+
+// tickPacer adapts the hub tick interval to the tick-cost EMA: it steps up the
+// moment the EMA crosses into a higher band, but only steps down after the EMA
+// has held in the lower band for pacingHysteresis. Transitions are logged once
+// per change. All state is hub-goroutine only.
+type tickPacer struct {
+	interval time.Duration // current cadence
+	lowSince time.Time     // when the EMA first sat below the current band (zero = not below)
+}
+
+// next returns the cadence for the following tick given the latest EMA.
+// now is passed in so tests can drive the hysteresis clock deterministically.
+func (p *tickPacer) next(ema time.Duration, now time.Time) time.Duration {
+	target := pacingBand(ema)
+	switch {
+	case target > p.interval:
+		p.set(target, ema) // burst: slow down immediately
+	case target < p.interval:
+		if p.lowSince.IsZero() {
+			p.lowSince = now
+		}
+		if now.Sub(p.lowSince) >= pacingHysteresis {
+			p.set(target, ema)
+		}
+	default:
+		p.lowSince = time.Time{}
+	}
+	return p.interval
+}
+
+func (p *tickPacer) set(interval time.Duration, ema time.Duration) {
+	if interval != p.interval {
+		log.Printf("hub pacing: %v → %v (tick EMA %v)", p.interval, interval, ema.Round(time.Microsecond))
+		p.interval = interval
+	}
+	p.lowSince = time.Time{}
+}
+
 // Hub maintains active WebSocket clients and computes per-client views.
 type Hub struct {
 	clients    map[*Client]bool
@@ -192,8 +264,16 @@ type viewStats struct {
 
 // Run starts the hub's main loop
 func (h *Hub) Run() {
-	ticker := time.NewTicker(100 * time.Millisecond) // Broadcast updates every 100ms
-	defer ticker.Stop()
+	// The tick runs on a timer re-armed at the END of each iteration (delay
+	// measured from tick completion) rather than a fixed ticker: slow ticks
+	// naturally stretch the cadence, and like a ticker's 1-slot buffer, ticks
+	// coalesce instead of queueing. The pacer adapts the interval to the
+	// smoothed tick cost (h.tickEMA), so bursts run at 2–5Hz — this covers the
+	// idle short-circuit and the anyLayoutBusy fast path in tick() too, since
+	// both are entered at this same cadence.
+	pacer := tickPacer{interval: tickIntervalFast}
+	timer := time.NewTimer(pacer.interval)
+	defer timer.Stop()
 
 	for {
 		select {
@@ -217,8 +297,9 @@ func (h *Hub) Run() {
 				client.mu.Unlock()
 			}
 
-		case <-ticker.C:
+		case <-timer.C:
 			h.tick()
+			timer.Reset(pacer.next(h.tickEMA, time.Now()))
 		}
 	}
 }
@@ -318,10 +399,7 @@ func (h *Hub) tick() {
 	// there is no point shipping more than the busiest handful per tick. At
 	// datacenter scale DrainFlows can return one entry per active edge —
 	// thousands — which without this cap dominated the wire.
-	if len(flows) > maxFlowsPerTick {
-		sort.Slice(flows, func(a, b int) bool { return flows[a].Packets > flows[b].Packets })
-		flows = flows[:maxFlowsPerTick]
-	}
+	flows = topKFlows(flows, maxFlowsPerTick)
 	var vlanByIP map[string]uint16
 	if subnetActive {
 		vlanByIP = h.graphMgr.VLANByIP()
@@ -448,6 +526,36 @@ func splitDelta(d *viewDelta) []*viewDelta {
 	first.Stats = d.Stats
 	chunks[nChunks-1].FullDone = true
 	return chunks
+}
+
+// topKFlows bounds the drained flows to the k busiest by packet count without
+// a full O(n log n) sort: a single pass keeps a descending-Packets slice of at
+// most k entries (insertion into the small slice is fine at k=60). The
+// selection criterion is the old full sort's comparator — Packets descending —
+// and ties keep drain order (a flow inserts after entries with equal Packets),
+// so the result equals the first k of a stable descending sort. Slices already
+// within the cap pass through unsorted, preserving the previous behavior.
+func topKFlows(flows []graph.TrafficFlow, k int) []graph.TrafficFlow {
+	if len(flows) <= k {
+		return flows
+	}
+	top := make([]graph.TrafficFlow, 0, k)
+	for _, f := range flows {
+		i := 0
+		for i < len(top) && top[i].Packets >= f.Packets {
+			i++
+		}
+		if i == k {
+			continue // smaller than (or tied below) everything currently kept
+		}
+		top = append(top, graph.TrafficFlow{})
+		copy(top[i+1:], top[i:])
+		top[i] = f
+		if len(top) > k {
+			top = top[:k]
+		}
+	}
+	return top
 }
 
 // trySend queues a message for a client, dropping the client (slow consumer)
@@ -809,7 +917,17 @@ func (c *Client) applyControl(msg ClientMessage) {
 		for _, cidr := range m.Expanded {
 			exp[cidr] = true
 		}
+		full := make(map[string]bool, len(m.FullExpand))
+		for _, cidr := range m.FullExpand {
+			full[cidr] = true
+		}
 		c.cfg.ExpandedSubnets = exp
+		c.cfg.FullExpand = full
+		c.cfg.FocusCIDR = m.Focus
+		switch m.ZoomBand {
+		case "far", "mid", "near", "":
+			c.cfg.ZoomBand = m.ZoomBand
+		}
 		c.cfg.AggregateThreshold = m.Threshold
 		c.needsFull = true
 	case msgResync:

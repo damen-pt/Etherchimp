@@ -2,6 +2,7 @@ package graph
 
 import (
 	"encoding/base64"
+	"strings"
 	"sync"
 	"time"
 
@@ -189,6 +190,47 @@ func (ps *PacketStore) GetPacketsBetween(setA, setB map[string]bool, sinceID, li
 		}
 	}
 	return result, cursor
+}
+
+// MostRecentForIPs returns the newest buffered packet whose src or dst IP is in
+// ipSet. The ring is stored oldest->newest, so we walk it from the tail.
+func (ps *PacketStore) MostRecentForIPs(ipSet map[string]bool) (PacketData, bool) {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	for i := ps.size - 1; i >= 0; i-- {
+		idx := (ps.head + i) % ps.maxPackets
+		p := ps.packets[idx]
+		if ipSet[p.SrcIP] || ipSet[p.DstIP] {
+			return p, true
+		}
+	}
+	return PacketData{}, false
+}
+
+// MostRecentContaining returns the newest buffered packet whose decoded payload
+// contains text (case-insensitive). Only the in-memory ring is searched, so
+// matches older than the buffer window are not found — full historic payload
+// search would require persisting payloads or pcap byte offsets (offsets are
+// currently never recorded).
+func (ps *PacketStore) MostRecentContaining(text string) (PacketData, bool) {
+	if text == "" {
+		return PacketData{}, false
+	}
+	lower := strings.ToLower(text)
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	for i := ps.size - 1; i >= 0; i-- {
+		idx := (ps.head + i) % ps.maxPackets
+		p := ps.packets[idx]
+		raw, err := base64.StdEncoding.DecodeString(p.Payload)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(strings.ToLower(string(raw)), lower) {
+			return p, true
+		}
+	}
+	return PacketData{}, false
 }
 
 // GetRecentPackets returns the most recent N packets in chronological order

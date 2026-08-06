@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"etherchimp/capture"
 	"etherchimp/graph"
 )
 
@@ -150,7 +151,7 @@ func (a *aggregator) apply(ev PacketEvent) {
 		eg.revP++
 		eg.revB += length
 	}
-	if ev.Proto != "TCP" && ev.Proto != "UDP" {
+	if !capture.IsGenericName(ev.Proto) {
 		eg.proto = ev.Proto
 	}
 	a.dirtyEdges[ek] = struct{}{}

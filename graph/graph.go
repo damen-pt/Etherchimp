@@ -14,7 +14,8 @@ import (
 type Node struct {
 	IP          string    `json:"id"`
 	Hostname    string    `json:"label"`
-	IPs         []string  `json:"ips"` // All IPs that map to this hostname
+	IPs         []string  `json:"ips"`            // All IPs that map to this hostname
+	MACs        []string  `json:"macs,omitempty"` // Ethernet MACs seen for this node (populated by the capture/merge path)
 	PacketCount int       `json:"packetCount"`
 	ByteCount   int64     `json:"byteCount"`
 	LastSeen    time.Time `json:"lastSeen"`
@@ -33,10 +34,18 @@ type Node struct {
 	ListenPorts map[uint16]int      `json:"-"` // well-known dst ports it received on (serving)
 	Peers       map[string]struct{} `json:"-"` // distinct peer node IDs (fan-out)
 
-	// Role/Icon are the classification result, filled in by SnapshotRaw under the
-	// read lock and carried out on the copy (safe scalars).
+	// Role/Icon are the classification result, committed by SnapshotRaw under the
+	// write lock (with flip damping, see classify.go) and carried out on the copy
+	// (safe scalars).
 	Role string `json:"-"`
 	Icon string `json:"-"`
+
+	// Role-flip damping state, mutated only by SnapshotRaw under the write lock.
+	// A candidate role different from Role must persist for roleFlipDamping
+	// before it is committed, so bursts (port scans) flip icons once, late,
+	// instead of flickering.
+	pendingRole  string    `json:"-"`
+	pendingSince time.Time `json:"-"`
 
 	// DeviceKind/DeviceInfo come from LLDP/CDP discovery: "switch" or "router",
 	// and the advertised port / management address. They make the node a
@@ -166,11 +175,18 @@ type Manager struct {
 	edges            map[string]*Edge
 	ipToNodeID       map[string]string // Maps IP -> node ID (for lookup)
 	hostnameToNodeID map[string]string // Maps hostname -> node ID (for merging)
+	macToNodeID      map[string]string // Maps host MAC -> node ID (identity anchor)
+	macShared        map[string]bool   // MACs seen concurrently on distinct hosts (router/NAT) — never anchor
 	packetStore      *PacketStore
 	dirty            bool                     // true when graph has been modified since last snapshot
 	recentFlows      map[flowKey]*TrafficFlow // per-edge traffic since last drain
 	protoCounts      map[string]int           // cumulative packets seen per protocol (all of them)
-	mu               sync.RWMutex
+	// macActiveWindow: if a MAC's current anchor node was seen more recently than
+	// this, a second distinct IP appearing on that MAC means two hosts share it
+	// concurrently (a gateway) rather than one host being re-addressed (DHCP), so
+	// we refuse to merge. Kept a bit above the DNS/decay cadence.
+	macActiveWindow time.Duration
+	mu              sync.RWMutex
 }
 
 // NewManager creates a new graph manager
@@ -180,9 +196,12 @@ func NewManager() *Manager {
 		edges:            make(map[string]*Edge),
 		ipToNodeID:       make(map[string]string),
 		hostnameToNodeID: make(map[string]string),
+		macToNodeID:      make(map[string]string),
+		macShared:        make(map[string]bool),
 		packetStore:      NewPacketStore(1000),
 		recentFlows:      make(map[flowKey]*TrafficFlow),
 		protoCounts:      make(map[string]int),
+		macActiveWindow:  90 * time.Second,
 	}
 }
 
@@ -260,103 +279,7 @@ func (m *Manager) addOrUpdateNodeLocked(ip, hostname string, bytes int) {
 
 	// If IP was previously part of a different node, merge the nodes
 	if existingNodeID != "" && existingNodeID != nodeID {
-		// Merge old node into new node
-		if oldNode, exists := m.nodes[existingNodeID]; exists {
-			// Transfer data if new node doesn't exist yet
-			if _, newExists := m.nodes[nodeID]; !newExists {
-				m.nodes[nodeID] = oldNode
-				m.nodes[nodeID].IP = nodeID // Update ID
-				m.nodes[nodeID].Hostname = hostname
-			} else {
-				// Merge stats into existing node
-				m.nodes[nodeID].PacketCount += oldNode.PacketCount
-				m.nodes[nodeID].ByteCount += oldNode.ByteCount
-				// Merge IPs using map for O(1) lookup instead of O(n²) nested loops
-				existingIPs := make(map[string]bool, len(m.nodes[nodeID].IPs))
-				for _, ip := range m.nodes[nodeID].IPs {
-					existingIPs[ip] = true
-				}
-				for _, oldIP := range oldNode.IPs {
-					if !existingIPs[oldIP] {
-						m.nodes[nodeID].IPs = append(m.nodes[nodeID].IPs, oldIP)
-					}
-				}
-			}
-			// Delete old node
-			delete(m.nodes, existingNodeID)
-		}
-
-		// Update all edges that used the old node ID
-		// Collect edges to update/merge to avoid modifying map during iteration
-		edgesToDelete := make([]string, 0)
-		edgesToAdd := make(map[string]*Edge)
-
-		for edgeID, edge := range m.edges {
-			updated := false
-			newFrom := edge.From
-			newTo := edge.To
-			if edge.From == existingNodeID {
-				newFrom = nodeID
-				updated = true
-			}
-			if edge.To == existingNodeID {
-				newTo = nodeID
-				updated = true
-			}
-			if updated {
-				// Skip self-loops that might be created by merging
-				if newFrom == newTo {
-					edgesToDelete = append(edgesToDelete, edgeID)
-					continue
-				}
-
-				// Calculate new canonical edge ID
-				newEdgeID, canonicalFrom, canonicalTo := getCanonicalEdgeID(newFrom, newTo)
-
-				if newEdgeID != edgeID {
-					edgesToDelete = append(edgesToDelete, edgeID)
-
-					// Check if an edge with the new ID already exists
-					if existingEdge, exists := m.edges[newEdgeID]; exists {
-						// Merge edge stats
-						existingEdge.PacketCount += edge.PacketCount
-						existingEdge.ByteCount += edge.ByteCount
-						existingEdge.ForwardPackets += edge.ForwardPackets
-						existingEdge.ReversePackets += edge.ReversePackets
-						existingEdge.ForwardBytes += edge.ForwardBytes
-						existingEdge.ReverseBytes += edge.ReverseBytes
-						if edge.LastSeen.After(existingEdge.LastSeen) {
-							existingEdge.LastSeen = edge.LastSeen
-						}
-					} else if pendingEdge, exists := edgesToAdd[newEdgeID]; exists {
-						// Merge with pending edge
-						pendingEdge.PacketCount += edge.PacketCount
-						pendingEdge.ByteCount += edge.ByteCount
-						pendingEdge.ForwardPackets += edge.ForwardPackets
-						pendingEdge.ReversePackets += edge.ReversePackets
-						pendingEdge.ForwardBytes += edge.ForwardBytes
-						pendingEdge.ReverseBytes += edge.ReverseBytes
-						if edge.LastSeen.After(pendingEdge.LastSeen) {
-							pendingEdge.LastSeen = edge.LastSeen
-						}
-					} else {
-						// Add as new edge with canonical ordering
-						edge.ID = newEdgeID
-						edge.From = canonicalFrom
-						edge.To = canonicalTo
-						edgesToAdd[newEdgeID] = edge
-					}
-				}
-			}
-		}
-
-		// Apply edge changes
-		for _, edgeID := range edgesToDelete {
-			delete(m.edges, edgeID)
-		}
-		for edgeID, edge := range edgesToAdd {
-			m.edges[edgeID] = edge
-		}
+		m.mergeNodeInto(nodeID, existingNodeID, hostname)
 	}
 
 	// Update IP mapping
@@ -394,6 +317,324 @@ func (m *Manager) addOrUpdateNodeLocked(ip, hostname string, bytes int) {
 		// Preserve group classification across updates
 		if isGroup {
 			node.IsGroup = true
+		}
+	}
+}
+
+// mergeNodeInto folds oldID's node and all its edges into newID, re-keying edges
+// to canonical form and merging duplicate stats. Shared by the IP->hostname
+// merge and the MAC-identity merge. Caller holds m.mu and guarantees
+// oldID != newID and oldID != "".
+func (m *Manager) mergeNodeInto(newID, oldID, hostname string) {
+	if oldNode, exists := m.nodes[oldID]; exists {
+		// Transfer data if new node doesn't exist yet
+		if _, newExists := m.nodes[newID]; !newExists {
+			m.nodes[newID] = oldNode
+			m.nodes[newID].IP = newID // Update ID
+			m.nodes[newID].Hostname = hostname
+		} else {
+			// Merge stats into existing node
+			m.nodes[newID].PacketCount += oldNode.PacketCount
+			m.nodes[newID].ByteCount += oldNode.ByteCount
+			// Merge IPs using map for O(1) lookup instead of O(n²) nested loops
+			existingIPs := make(map[string]bool, len(m.nodes[newID].IPs))
+			for _, ip := range m.nodes[newID].IPs {
+				existingIPs[ip] = true
+			}
+			for _, oldIP := range oldNode.IPs {
+				if !existingIPs[oldIP] {
+					m.nodes[newID].IPs = append(m.nodes[newID].IPs, oldIP)
+				}
+			}
+			// Merge MACs the same way.
+			existingMACs := make(map[string]bool, len(m.nodes[newID].MACs))
+			for _, mc := range m.nodes[newID].MACs {
+				existingMACs[mc] = true
+			}
+			for _, mc := range oldNode.MACs {
+				if !existingMACs[mc] {
+					m.nodes[newID].MACs = append(m.nodes[newID].MACs, mc)
+				}
+			}
+		}
+		// Delete old node
+		delete(m.nodes, oldID)
+	}
+
+	// Update all edges that used the old node ID
+	// Collect edges to update/merge to avoid modifying map during iteration
+	edgesToDelete := make([]string, 0)
+	edgesToAdd := make(map[string]*Edge)
+
+	for edgeID, edge := range m.edges {
+		updated := false
+		newFrom := edge.From
+		newTo := edge.To
+		if edge.From == oldID {
+			newFrom = newID
+			updated = true
+		}
+		if edge.To == oldID {
+			newTo = newID
+			updated = true
+		}
+		if updated {
+			// Skip self-loops that might be created by merging
+			if newFrom == newTo {
+				edgesToDelete = append(edgesToDelete, edgeID)
+				continue
+			}
+
+			// Calculate new canonical edge ID
+			newEdgeID, canonicalFrom, canonicalTo := getCanonicalEdgeID(newFrom, newTo)
+
+			if newEdgeID != edgeID {
+				edgesToDelete = append(edgesToDelete, edgeID)
+
+				// Check if an edge with the new ID already exists
+				if existingEdge, exists := m.edges[newEdgeID]; exists {
+					// Merge edge stats
+					existingEdge.PacketCount += edge.PacketCount
+					existingEdge.ByteCount += edge.ByteCount
+					existingEdge.ForwardPackets += edge.ForwardPackets
+					existingEdge.ReversePackets += edge.ReversePackets
+					existingEdge.ForwardBytes += edge.ForwardBytes
+					existingEdge.ReverseBytes += edge.ReverseBytes
+					if edge.LastSeen.After(existingEdge.LastSeen) {
+						existingEdge.LastSeen = edge.LastSeen
+					}
+				} else if pendingEdge, exists := edgesToAdd[newEdgeID]; exists {
+					// Merge with pending edge
+					pendingEdge.PacketCount += edge.PacketCount
+					pendingEdge.ByteCount += edge.ByteCount
+					pendingEdge.ForwardPackets += edge.ForwardPackets
+					pendingEdge.ReversePackets += edge.ReversePackets
+					pendingEdge.ForwardBytes += edge.ForwardBytes
+					pendingEdge.ReverseBytes += edge.ReverseBytes
+					if edge.LastSeen.After(pendingEdge.LastSeen) {
+						pendingEdge.LastSeen = edge.LastSeen
+					}
+				} else {
+					// Add as new edge with canonical ordering
+					edge.ID = newEdgeID
+					edge.From = canonicalFrom
+					edge.To = canonicalTo
+					edgesToAdd[newEdgeID] = edge
+				}
+			}
+		}
+	}
+
+	// Apply edge changes
+	for _, edgeID := range edgesToDelete {
+		delete(m.edges, edgeID)
+	}
+	for edgeID, edge := range edgesToAdd {
+		m.edges[edgeID] = edge
+	}
+
+	// Repoint any IP/MAC lookups from the deleted node to the surviving one so
+	// later packets for those addresses resolve correctly (and don't try to
+	// re-merge a node that no longer exists).
+	for ip, id := range m.ipToNodeID {
+		if id == oldID {
+			m.ipToNodeID[ip] = newID
+		}
+	}
+	for mc, id := range m.macToNodeID {
+		if id == oldID {
+			m.macToNodeID[mc] = newID
+		}
+	}
+}
+
+// isHostMAC reports whether mac is a stable per-host identity: a well-formed,
+// unicast address that isn't broadcast or all-zero. Multicast/broadcast MACs
+// (low bit of the first octet set) are destinations, not host identities, so
+// they never anchor. Locally-administered MACs (VMs, containers) are allowed —
+// they are legitimate host identities.
+func isHostMAC(mac string) bool {
+	if len(mac) < 17 { // "xx:xx:xx:xx:xx:xx"
+		return false
+	}
+	hi, ok1 := hexNibble(mac[0])
+	lo, ok2 := hexNibble(mac[1])
+	if !ok1 || !ok2 {
+		return false
+	}
+	first := hi<<4 | lo
+	if first&0x01 != 0 { // multicast/broadcast (includes ff:ff:...)
+		return false
+	}
+	if mac == "00:00:00:00:00:00" {
+		return false
+	}
+	return true
+}
+
+func hexNibble(c byte) (int, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0'), true
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10, true
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10, true
+	}
+	return 0, false
+}
+
+func containsString(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// recordMACLocked attaches mac to the node and, when safe, uses it as a stable
+// identity anchor so a host keeps one node across IP changes (DHCP). It refuses
+// to anchor a MAC that is seen on two distinct hosts concurrently (a gateway/NAT
+// MAC forwarding many IPs), which would otherwise collapse unrelated hosts into
+// one node. Caller holds m.mu.
+func (m *Manager) recordMACLocked(nodeID, mac string) {
+	if nodeID == "" || !isHostMAC(mac) {
+		return
+	}
+	node, ok := m.nodes[nodeID]
+	if !ok {
+		return
+	}
+	// Always record the MAC on the node (display + eth.addr search), even for
+	// shared MACs — only identity anchoring is withheld.
+	if !containsString(node.MACs, mac) {
+		node.MACs = append(node.MACs, mac)
+	}
+	if m.macShared[mac] {
+		return
+	}
+
+	anchorID, anchored := m.macToNodeID[mac]
+	if !anchored {
+		m.macToNodeID[mac] = nodeID
+		// First exclusive host MAC: re-key the node so MAC is the stable id
+		// (ultimate identity). Hostname/IPs remain attributes on the node.
+		m.promoteNodeIDToMAC(nodeID, mac)
+		return
+	}
+	if anchorID == nodeID {
+		// Already anchored here — still promote if id is still an IP/hostname.
+		m.promoteNodeIDToMAC(nodeID, mac)
+		return
+	}
+	anchor, exists := m.nodes[anchorID]
+	if !exists {
+		// Previous anchor decayed away: treat this as the current holder.
+		m.macToNodeID[mac] = nodeID
+		m.promoteNodeIDToMAC(nodeID, mac)
+		return
+	}
+	// Same MAC now appears on a different live node. If the previous anchor is
+	// still recently active, two hosts use this MAC at once -> gateway/NAT, so
+	// mark it shared and never anchor it again. If the previous anchor has gone
+	// quiet, this is a re-addressing (DHCP) of the same host -> merge.
+	if time.Since(anchor.LastSeen) < m.macActiveWindow {
+		m.macShared[mac] = true
+		delete(m.macToNodeID, mac)
+		// If we already re-keyed the anchor to the MAC id, demote it back to an
+		// IP key — a shared gateway MAC must not be any node's identity.
+		m.demoteMACIdentity(mac, anchorID)
+		return
+	}
+	m.mergeNodeInto(nodeID, anchorID, node.Hostname)
+	m.macToNodeID[mac] = nodeID
+	m.promoteNodeIDToMAC(nodeID, mac)
+}
+
+// promoteNodeIDToMAC re-keys a node so its map key / edge endpoints use the
+// exclusive host MAC. Human-readable Hostname and multi-IP lists are preserved.
+// No-op for groups, shared MACs, or nodes already keyed by this MAC.
+func (m *Manager) promoteNodeIDToMAC(nodeID, mac string) {
+	if nodeID == "" || mac == "" || nodeID == mac || m.macShared[mac] {
+		return
+	}
+	if !isHostMAC(mac) {
+		return
+	}
+	node, ok := m.nodes[nodeID]
+	if !ok || node.IsGroup {
+		return
+	}
+	// Already MAC-shaped id for a different MAC — leave alone.
+	if isHostMAC(nodeID) {
+		return
+	}
+	hostname := node.Hostname
+	if hostname == "" || hostname == nodeID {
+		for _, ip := range node.IPs {
+			if _, g := groupAddressLabel(ip); !g {
+				hostname = ip
+				break
+			}
+		}
+		if hostname == "" {
+			hostname = nodeID
+		}
+	}
+	// mergeNodeInto folds oldID into newID; creates newID from old when needed.
+	m.mergeNodeInto(mac, nodeID, hostname)
+	if n := m.nodes[mac]; n != nil {
+		n.IP = mac
+		if n.Hostname == "" || n.Hostname == mac {
+			n.Hostname = hostname
+		}
+	}
+	m.macToNodeID[mac] = mac
+	// Drop stale hostname map entry for the old id.
+	if m.hostnameToNodeID[nodeID] == nodeID {
+		delete(m.hostnameToNodeID, nodeID)
+	}
+	if hostname != "" && hostname != mac {
+		m.hostnameToNodeID[hostname] = mac
+	}
+}
+
+// demoteMACIdentity re-keys a node that was promoted to a MAC id back to a
+// unicast IP id. Used when that MAC is later discovered to be a shared
+// gateway/NAT address rather than a host identity.
+func (m *Manager) demoteMACIdentity(mac, nodeID string) {
+	if nodeID != mac {
+		// Anchor may have been promoted after we captured nodeID; resolve live.
+		if m.nodes[mac] != nil {
+			nodeID = mac
+		} else {
+			return
+		}
+	}
+	node := m.nodes[nodeID]
+	if node == nil {
+		return
+	}
+	newID := ""
+	for _, ip := range node.IPs {
+		if _, g := groupAddressLabel(ip); !g {
+			newID = ip
+			break
+		}
+	}
+	if newID == "" || newID == nodeID {
+		return
+	}
+	hostname := node.Hostname
+	if hostname == "" || hostname == mac {
+		hostname = newID
+	}
+	m.mergeNodeInto(newID, nodeID, hostname)
+	if n := m.nodes[newID]; n != nil {
+		n.IP = newID
+		if n.Hostname == "" || n.Hostname == mac {
+			n.Hostname = hostname
 		}
 	}
 }
@@ -512,7 +753,7 @@ func (m *Manager) addOrUpdateEdgeLocked(srcIP, dstIP string, protocol capture.Pr
 			edge.ReverseBytes += int64(bytes)
 		}
 		// Update protocol if it's more specific
-		if protocol.Name != "TCP" && protocol.Name != "UDP" {
+		if !protocol.Generic {
 			edge.Protocol = protocol
 		}
 	}
@@ -569,16 +810,22 @@ func (m *Manager) GetSnapshot() GraphSnapshot {
 // SnapshotRaw returns an unfiltered copy of the graph's nodes and edges without
 // packets. Taken once per hub tick and fed to per-client BuildView so the copy
 // work happens once rather than per client.
+//
+// It takes the write lock (not RLock) because it also commits the damped role
+// classification onto each node; once per hub tick this is cheap and keeps the
+// damping state next to the stats it derives from.
 func (m *Manager) SnapshotRaw() RawSnapshot {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
+	now := time.Now()
 	nodes := make([]Node, 0, len(m.nodes))
 	for _, node := range m.nodes {
-		cp := *node
-		// Classify under the read lock, where the stat maps are safe to read, and
+		// Commit the (damped) classification under the write lock, where the stat
+		// maps are safe to read and the damping state is safe to mutate, then
 		// carry only the scalar Role/Icon out on the copy.
-		cp.Role, cp.Icon = classifyNode(node)
+		commitRole(node, now)
+		cp := *node
 		nodes = append(nodes, cp)
 	}
 	edges := make([]Edge, 0, len(m.edges))
@@ -607,6 +854,27 @@ func (m *Manager) GetPacketsForNode(nodeID string, sinceID, limit int) ([]Packet
 	ipSet[nodeID] = true
 	m.mu.RUnlock()
 	return m.packetStore.GetPacketsForIPs(ipSet, sinceID, limit)
+}
+
+// MostRecentPacketForNode returns the newest buffered packet involving any IP of
+// the given node, with its payload — used by the search click-through to open
+// the packet inspector on a node's latest traffic instead of only the sidebar.
+func (m *Manager) MostRecentPacketForNode(nodeID string) (PacketData, bool) {
+	m.mu.RLock()
+	ipSet := map[string]bool{nodeID: true}
+	if node, ok := m.nodes[nodeID]; ok {
+		for _, ip := range node.IPs {
+			ipSet[ip] = true
+		}
+	}
+	m.mu.RUnlock()
+	return m.packetStore.MostRecentForIPs(ipSet)
+}
+
+// MostRecentPacketContaining returns the newest buffered packet whose payload
+// contains text (case-insensitive). Ring-only; see PacketStore.MostRecentContaining.
+func (m *Manager) MostRecentPacketContaining(text string) (PacketData, bool) {
+	return m.packetStore.MostRecentContaining(text)
 }
 
 // GetPacketsForEdge returns packets exchanged between the two endpoints of an
@@ -715,90 +983,134 @@ func (m *Manager) Ingest(pkt *capture.PacketInfo, srcHostname, dstHostname strin
 	m.dirty = true
 	m.addOrUpdateNodeLocked(pkt.SrcIP, srcHostname, pkt.Length)
 	m.addOrUpdateNodeLocked(pkt.DstIP, dstHostname, pkt.Length)
+	// Anchor host identity by MAC (DHCP re-addressing), after both nodes exist.
+	// Any merge here re-keys edges, so it must run before the edge is added.
+	if pkt.SrcMAC != "" {
+		if id, ok := m.ipToNodeID[pkt.SrcIP]; ok {
+			m.recordMACLocked(id, pkt.SrcMAC)
+		}
+	}
+	if pkt.DstMAC != "" {
+		if id, ok := m.ipToNodeID[pkt.DstIP]; ok {
+			m.recordMACLocked(id, pkt.DstMAC)
+		}
+	}
 	m.addOrUpdateEdgeLocked(pkt.SrcIP, pkt.DstIP, pkt.Protocol, pkt.Length)
 	m.addPortObservationLocked(pkt.SrcIP, pkt.DstIP, pkt.SrcPort, pkt.DstPort)
 	m.stampDeviceInfoLocked(pkt)
 }
 
-// RemoveStaleNodes removes nodes that haven't been seen recently
+// RemoveStaleNodes removes nodes that haven't been seen recently, at most
+// maxNodeRemovalsPerSweep per call, stalest first — see decay.go for why
+// removal is staggered.
 func (m *Manager) RemoveStaleNodes(threshold time.Duration) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	now := time.Now()
-	removed := 0
 
-	// Collect stale node IDs first to avoid modifying map during iteration
-	staleNodeIDs := make([]string, 0)
-	for nodeID, node := range m.nodes {
+	// Collect stale candidates first to avoid modifying the map during
+	// iteration, then take only the stalest few so one sweep can't mass-remove
+	// a whole burst's worth of corpses at once.
+	stale := make([]*Node, 0)
+	for _, node := range m.nodes {
 		if now.Sub(node.LastSeen) > threshold {
-			staleNodeIDs = append(staleNodeIDs, nodeID)
+			stale = append(stale, node)
 		}
 	}
+	sort.Slice(stale, func(i, j int) bool {
+		if stale[i].LastSeen.Equal(stale[j].LastSeen) {
+			return stale[i].IP < stale[j].IP // deterministic tie-break
+		}
+		return stale[i].LastSeen.Before(stale[j].LastSeen)
+	})
+	if len(stale) > maxNodeRemovalsPerSweep {
+		stale = stale[:maxNodeRemovalsPerSweep]
+	}
 
-	if len(staleNodeIDs) > 0 {
+	if len(stale) > 0 {
 		m.dirty = true
 	}
 
-	// Remove stale nodes and clean up mappings
-	for _, nodeID := range staleNodeIDs {
-		node := m.nodes[nodeID]
-		if node != nil {
-			// Remove all IP mappings for this node
-			for _, ip := range node.IPs {
-				delete(m.ipToNodeID, ip)
+	// Remove the selected stale nodes and clean up mappings
+	for _, node := range stale {
+		nodeID := node.IP
+		// Remove all IP mappings for this node
+		for _, ip := range node.IPs {
+			delete(m.ipToNodeID, ip)
+		}
+		// Remove hostname mapping if it exists
+		if node.Hostname != "" && node.Hostname != nodeID {
+			delete(m.hostnameToNodeID, node.Hostname)
+		}
+		// Also check if nodeID itself is a hostname
+		delete(m.hostnameToNodeID, nodeID)
+		// Drop any MAC anchors pointing at this node.
+		for _, mac := range node.MACs {
+			if m.macToNodeID[mac] == nodeID {
+				delete(m.macToNodeID, mac)
 			}
-			// Remove hostname mapping if it exists
-			if node.Hostname != "" && node.Hostname != nodeID {
-				delete(m.hostnameToNodeID, node.Hostname)
-			}
-			// Also check if nodeID itself is a hostname
-			delete(m.hostnameToNodeID, nodeID)
 		}
 		delete(m.nodes, nodeID)
-		removed++
 	}
 
-	return removed
+	return len(stale)
 }
 
-// RemoveStaleEdges removes edges that haven't been seen recently
+// RemoveStaleEdges removes edges that haven't been seen recently, at most
+// maxEdgeRemovalsPerSweep per call, stalest first — see decay.go for why
+// removal is staggered.
 func (m *Manager) RemoveStaleEdges(threshold time.Duration) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	now := time.Now()
 
-	// Collect stale edge IDs first to avoid modifying map during iteration
-	staleEdgeIDs := make([]string, 0)
-	for id, edge := range m.edges {
+	// Collect stale candidates first, then cap the sweep stalest-first (same
+	// staggering as RemoveStaleNodes).
+	stale := make([]*Edge, 0)
+	for _, edge := range m.edges {
 		if now.Sub(edge.LastSeen) > threshold {
-			staleEdgeIDs = append(staleEdgeIDs, id)
+			stale = append(stale, edge)
 		}
 	}
+	sort.Slice(stale, func(i, j int) bool {
+		if stale[i].LastSeen.Equal(stale[j].LastSeen) {
+			return stale[i].ID < stale[j].ID // deterministic tie-break
+		}
+		return stale[i].LastSeen.Before(stale[j].LastSeen)
+	})
+	if len(stale) > maxEdgeRemovalsPerSweep {
+		stale = stale[:maxEdgeRemovalsPerSweep]
+	}
 
-	if len(staleEdgeIDs) > 0 {
+	if len(stale) > 0 {
 		m.dirty = true
 	}
 
-	// Remove stale edges
-	for _, id := range staleEdgeIDs {
-		delete(m.edges, id)
+	// Remove the selected stale edges
+	for _, edge := range stale {
+		delete(m.edges, edge.ID)
 	}
 
-	return len(staleEdgeIDs)
+	return len(stale)
 }
 
 // NodeDetail is the full lazily-fetched record for one node (Phase 5): the
 // fields stripped from the streamed ViewNode plus a connection summary. Served
-// by GET /api/node?id=.
+// by GET /api/node?id=. MAC is the hardware identity when known; a node may
+// hold many IPs/names (multi-homed hosts, k8s nodes, DHCP renames).
 type NodeDetail struct {
 	ID          string           `json:"id"`
 	Label       string           `json:"label"`
 	IPs         []string         `json:"ips,omitempty"`
+	MACs        []string         `json:"macs,omitempty"`
+	PrimaryMAC  string           `json:"primaryMac,omitempty"` // exclusive host MAC when known
 	Role        string           `json:"role,omitempty"`
 	Icon        string           `json:"icon,omitempty"`
 	DeviceInfo  string           `json:"deviceInfo,omitempty"`
+	Vendor      string           `json:"vendor,omitempty"`      // IEEE OUI org for the primary MAC
+	DeviceClass string           `json:"deviceClass,omitempty"` // coarse device category from the vendor
 	PacketCount int              `json:"packetCount"`
 	ByteCount   int64            `json:"byteCount"`
 	IsGroup     bool             `json:"isGroup,omitempty"`
@@ -819,11 +1131,22 @@ type NodeDetailEdge struct {
 
 // GetNodeDetail returns the full record for one node, or false when unknown.
 // Edge summaries are capped so a datacenter hub doesn't return megabytes.
+// Also resolves lookup by any known IP or MAC alias of the node.
 func (m *Manager) GetNodeDetail(id string) (NodeDetail, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	n, ok := m.nodes[id]
 	if !ok {
+		// Resolve IP or MAC aliases to the canonical node id.
+		if nid, ok2 := m.ipToNodeID[id]; ok2 {
+			n, ok = m.nodes[nid]
+			id = nid
+		} else if nid, ok2 := m.macToNodeID[id]; ok2 {
+			n, ok = m.nodes[nid]
+			id = nid
+		}
+	}
+	if !ok || n == nil {
 		return NodeDetail{}, false
 	}
 	role, icon := classifyNode(n)
@@ -831,13 +1154,31 @@ func (m *Manager) GetNodeDetail(id string) (NodeDetail, bool) {
 	if label == "" {
 		label = id
 	}
+	primaryMAC := ""
+	if len(n.MACs) > 0 {
+		primaryMAC = n.MACs[0]
+	}
+	// Prefer exclusive MAC identity when this node is the live anchor.
+	for _, mc := range n.MACs {
+		if m.macToNodeID[mc] == id && !m.macShared[mc] {
+			primaryMAC = mc
+			break
+		}
+	}
+	// Identify the maker (and a coarse device category) from the primary MAC's
+	// IEEE OUI. Only meaningful for real Ethernet hosts, not group/MAC-less nodes.
+	vendor, deviceClass := capture.IdentifyMAC(primaryMAC)
 	d := NodeDetail{
 		ID:          id,
 		Label:       label,
 		IPs:         append([]string(nil), n.IPs...),
+		MACs:        append([]string(nil), n.MACs...),
+		PrimaryMAC:  primaryMAC,
 		Role:        role,
 		Icon:        icon,
 		DeviceInfo:  n.DeviceInfo,
+		Vendor:      vendor,
+		DeviceClass: deviceClass,
 		PacketCount: n.PacketCount,
 		ByteCount:   n.ByteCount,
 		IsGroup:     n.IsGroup,
@@ -904,6 +1245,14 @@ func (m *Manager) SearchNodes(query string, limit int) []SearchResult {
 		if !match {
 			for _, ip := range n.IPs {
 				if strings.Contains(strings.ToLower(ip), q) {
+					match = true
+					break
+				}
+			}
+		}
+		if !match {
+			for _, mc := range n.MACs {
+				if strings.Contains(strings.ToLower(mc), q) {
 					match = true
 					break
 				}
@@ -1066,7 +1415,7 @@ func (m *Manager) BulkLoad(nodes []BulkNode, edges []BulkEdge) {
 			edge.ForwardBytes += fwdB
 			edge.ReverseBytes += revB
 			edge.LastSeen = time.Now()
-			if proto.Name != "TCP" && proto.Name != "UDP" {
+			if !proto.Generic {
 				edge.Protocol = proto
 			}
 		} else {

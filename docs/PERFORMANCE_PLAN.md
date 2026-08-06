@@ -214,3 +214,244 @@ development.
 Explicit non-goals (per requirements): no changes to force-layout constants,
 gravity, temperatures, collision, easing feel, or any physics behavior — server or
 client. All changes are transport and presentation.
+
+## Phase 6 — Fluid large clusters (2026-07-09)
+
+Target: smoothness when **many individual hosts are visible inside large clusters**
+(expand/drill-down), not just the aggregated overview path.
+
+### Shipped
+
+- **Budgeted expand** (`DefaultExpandBudget=120`): opening a dense CIDR reveals
+  only the busiest members; quieter hosts stay as an orange residual `+N more`
+  supernode (`id = cidr+"+"`, `isTail`). **Expand all** / residual click sets
+  `FullExpand` to bypass the budget.
+- **Isolate focus** (`FocusCIDR`): “Focus cluster” hides outsiders and raises
+  per-view caps (800/1600) so drill-down stays useful; floating badge to exit.
+- **Zoom LOD** (`ZoomBand` far/mid/near): client reports camera scale; server
+  adjusts aggregation threshold and expand budget. User pin-open always wins.
+- **Expand bloom** (`layout.go`): members of a departed supernode seed in a disk
+  around its last position; cooler reheat so the rest of the map barely moves.
+- **GL hot path**: dirty node/edge buffers (camera-only pans skip rebuild),
+  spatial-hash hit-test, far-zoom straight edges (`curve=0`), adaptive particle
+  cap under load; focus dim marks scene dirty.
+- **Cosmos explore**: `/16` cluster forces via `setPointClusters`; Map vs Explore
+  mode toggle in Clusters menu (`?renderer=cosmos&scale=raw`).
+
+### Hybrid stance (unchanged)
+
+GL + server aggregation remains the polished default. Cosmos raw remains the
+high-N explorer. Do not collapse to a single renderer.
+
+## Phase 7 — Cosmos solar-system explorer (2026-07-09)
+
+Complete overhaul of the cosmos path for diagnostic/forensic use at hundreds–
+~1000 nodes:
+
+- **No GPU force bounce.** `enableSimulation: false`; server **solar layout**
+  (`graph/solar.go`, mode `solar`) places /24 star-systems and host planets on
+  deterministic orbits. Traffic never flings nodes across the screen.
+- **ownsLayout = false** — binary position frames + client easing like WebGL.
+- **Planet labels** — HTML overlay with name + primary IP (LOD by zoom).
+- **Click parity** — details panel, MAC identity, multi-IP, recent packets,
+  connection list from `/api/node`.
+- **MAC ultimate identity** — exclusive host MACs re-key the node; multi-IP and
+  hostname remain attributes; shared gateway MACs demote and never merge.
+- **Explore (Solar)** menu mode loads `?renderer=cosmos` with layout `solar`
+  (not raw). Optional `?scale=raw` still available for unaggregated browsing.
+- Starfield backdrop + light edge particles for solar-system exploration feel.
+
+## Phase 8 — Datacenter 500+ node review (2026-08-05)
+
+Fresh end-to-end review targeting continuous monitoring of 500+ visible nodes
+at ~5–10k pkt/s with 1–5 clients, plus a user-editable protocol catalog.
+Visualizations, layout constants, and physics feel unchanged throughout.
+
+### Findings (ranked) and resolutions
+
+1. **Per-client O(n²) force layout every tick, even when converged** — the #1
+   bottleneck: `stepForce` ran 6 all-pairs iterations (~750k pair-evals at 500
+   nodes) per client per 100ms tick, serialized on the hub goroutine; 3+
+   clients blew the tick budget. **Fixed:** `LayoutEngine.Step` now skips the
+   relaxation entirely when the mode's existing `settled` flag is set, the
+   node-set signature is unchanged, and pins are unchanged (new
+   `forceCanSkip`/`pinsEqual` in `graph/layout.go`; per-mode state, so mode
+   switches are unaffected). Any change — new node, expand/collapse, reheat,
+   pin — un-settles via the pre-existing paths and animates exactly as before.
+   Measured (500-node harness): settled step 5.6ms → ~31µs. Tests:
+   `graph/layout_test.go`.
+2. **Unbuffered per-packet pcap `write()` syscalls on the capture goroutine**
+   (local + SSH paths) — a hard throughput ceiling with silent kernel-side
+   drops on disk stall. **Fixed:** `capture/pcapwriter.go` — `bufio.Writer`
+   (256KB) + `pcapgo` on a bounded 4096-packet queue drained by its own
+   goroutine, 500ms flush ticker, clean drain/flush/close on shutdown, drop
+   counter with rate-limited logging. Pause/shutdown semantics preserved;
+   payload bytes are copied at enqueue (mandatory under NoCopy).
+3. **Stream subsystem per-packet cost and memory** (`stream/stream.go`) —
+   **Fixed:** packet payload base64 moved to serve-time (`StreamPacket.MarshalJSON`;
+   JSON shape identical); `generateSummary` recomputed only on protocol change
+   or first payload bytes (counts inside summary strings now freeze — live
+   counts remain on `StreamInfo.PacketCount`/`ByteCount`); O(1000) eviction
+   scan replaced with a `container/list` LRU preserving
+   least-recently-seen-first semantics; per-direction payload cap 1MB → 64KB
+   (UI truncates display at ≤4KB everywhere).
+4. **Single ingest goroutine ceiling / silent drops** — **Fixed:**
+   `startStreamFeeder` (main.go) moves `streamMgr.AddPacket` off the ingest
+   goroutine onto its own 4096-buffered channel, started before all mode
+   branches; `packetChan` and stream-queue overflows now counted and logged
+   rate-limited (capture `dropCounter`, main `noteStreamDrop`).
+5. **Eager gopacket decode + buffer copy per packet** — **Fixed:**
+   `DecodeOptions{Lazy:true, NoCopy:true}` on the local PacketSource and the
+   SSH `NewPacket`. Audit: `copyPayload` is the only retention of frame bytes;
+   all layer access is `packet.Layer(...)` (forces lazy decode); VXLAN/Geneve
+   inner re-parse unaffected. Replay path left at defaults deliberately.
+6. **Per-client 1s counts-frame JSON (~60–150KB/client/s at full churn)** —
+   already delta-encoded in the tree (`Client.lastNodeCounts`/`lastEdgeCounts`,
+   client-side merge in `applyCountsFrame`, reset on full sync). Reviewed
+   end-to-end; no change needed.
+7. **`DrainFlows` full sort per tick to keep top 60** — **Fixed:**
+   `topKFlows` (server/websocket.go) single-pass bounded selection, same
+   comparator (Packets desc, ties in drain order). Tests:
+   `server/websocket_test.go`.
+8. **`mergeNodeInto` O(E+maps) sweeps under the write lock** — transient
+   (startup/DNS-completion merge bursts), not steady-state. A correct fix
+   needs incremental reverse indexes; risk outweighs reward at this scale.
+   **Accepted, not changed.**
+
+Architectural note (accepted): the styled view still recomputes per client per
+tick on one hub goroutine — fixes 1/6/7 remove the dominant costs inside that
+shape. If client count grows well beyond ~5, the next step is sharing
+BuildView results between identically-configured clients (raw mode already
+does this via `rawTopoCache`).
+
+### Measured after (this change)
+
+- `go build ./...`, `go vet`, `go test -count=1 ./...` — all green.
+- `-synth 500 -synth-rate 5000`, 3 WS clients: hub tick EMA **~5.7ms** of the
+  100ms budget.
+- `-synth 5000 -synth-rate 5000`, 2 WS clients: tick EMA **~27ms**.
+- Live capture smoke (`-i any`): 1370 packets written, pcap valid under
+  `tcpdump -r`; replay smoke: 11038 packets loaded.
+
+### Protocol catalog moved to `protocols.json`
+
+All protocol/port conventions formerly hardcoded in `capture/protocols.go`
+now live in a user-editable JSON file: protocol definitions
+(name/color/layer/layerNum), TCP/UDP port→protocol maps, and the ~200-entry
+well-known service port labels. Shipped defaults are embedded via `go:embed`
+(`capture/protocols.json`) and materialized to `./protocols.json` on first
+run; `-protocols <path>` overrides. Loaded at startup — restart to apply
+edits (lenient validation: bad entries are skipped with warnings, malformed
+JSON falls back to embedded defaults).
+
+- New semantic flags replace name-string special cases so edits can't break
+  behavior: `generic` (TCP/UDP sentinel rule, also used by store),
+  `decap` (VXLAN/Geneve overlay decap), `l2Endpoints` (LLDP/CDP),
+  `discovery` (multicast-drop exemption), `defaultVisible` (drives
+  `DefaultVisible/HiddenProtocols`).
+- `DetectProtocol` resolves everything (port lookups and L2/L3 structural
+  detections) through the registry, so custom colors/names propagate to edges.
+  Port detection checks dst port first, then src.
+- `GET /api/protocols` serves the catalog; the frontend builds its legend,
+  layer grouping, and default-visible set from it at startup (hardcoded
+  tables remain as fetch-failure fallback). Note: legend grouping now follows
+  the catalog's layer labels — WireGuard/OpenVPN appear under
+  "L7 · Application" rather than the old bespoke "VPN · Tunnel" group, K8s
+  under L7, and a new "OT · Industrial" section appears; edit the `layer`
+  strings in `protocols.json` if different grouping is wanted. The
+  server-driven default-visible set (10 protocols) now matches what the
+  server already enforced.
+- Tests: `capture/protocols_test.go` (port regressions, overrides, malformed
+  JSON, registry-resolved detection).
+
+## Phase 9 — Burst smoothness (2026-08-05)
+
+Target: the graph stays smooth through traffic spikes (NMAP-scan-class mass
+node/edge churn). Real-ish time, but favor smoothness over instant reaction.
+All mechanisms are server-side; the client needed no changes (calmer
+positions = calm rendering; client frame cost was already ~8ms at 3k nodes).
+
+### Findings (ranked) and resolutions
+
+1. **Continuous layout reheat while the node set changes every tick** — scan
+   arrivals re-heated the whole force graph to temp 70 every 100ms tick;
+   existing nodes swam for the scan's duration and the settle-gate could
+   never engage. **Fixed:** burst mode in `graph/layout.go`. The engine keeps
+   a per-mode ring of the last `burstWindowSteps=10` node-set sizes; growth
+   of `>burstGrowthAbs=25` nodes, or `>burstGrowthPct=10%` with an absolute
+   floor of `burstGrowthPctFloor=10`, enters burst mode. During a burst,
+   already-placed nodes are frozen at integration (they still exert forces;
+   user pins untouched; frozen–frozen pairs are skipped in the O(n²) loop),
+   newcomers seed near their connected neighbor as before and settle at a
+   capped temperature (`forceReheatTemp*burstTempFactor = 70*0.3`), and the
+   global reheat is suppressed. After `burstStableSteps=10` stable steps the
+   burst exits with ONE gentle reheat at the expand-bloom temperature
+   (70*0.55), then the graph re-settles and the skip gate resumes.
+   Newcomers are tracked per mode across the whole burst (`burstNew`) so
+   late arrivals keep settling while elders stay frozen. No-burst behavior
+   is byte-identical. Tests: `graph/layout_test.go` (freeze, single exit
+   reheat, small-add non-burst).
+2. **Aggregation cliff + top-N flap** — visible-host count oscillating around
+   the 300 threshold flipped the display strategy tick to tick, and the
+   top-500 sort had no tiebreak/stickiness. **Fixed:** hysteresis — collapse
+   at >300, re-expand only below `threshold*5/6` (~250,
+   `aggregateReexpandDivisor=6`); deterministic ID tiebreak in the kept-node
+   sort; incumbent stickiness (`incumbentBonus=1.1` on the sort key only,
+   never on displayed counts). Per-view state lives in a pointer-keyed side
+   table (`viewStates`, bounded at `maxViewStates=64`) since `BuildView`
+   gets `ViewConfig` by value. Tests: `graph/view_test.go`
+   (hysteresis band, top-N stability, displacement by a clear leader).
+3. **Role/icon reclassification churn** — scan fan-out flipped the scanner to
+   "gateway" (≥16 peers) and hosts to "server" mid-burst, each flip a style
+   delta. **Fixed:** `commitRole` damping (`graph/classify.go`) — role flips
+   commit only after the candidate persists `roleFlipDamping=2s`; first
+   classification commits immediately; flickers within the window never
+   commit. Damping state lives on `Node`; `SnapshotRaw` moved to the write
+   lock to mutate it (once per tick, cheap). `GetNodeDetail` still shows the
+   instantaneous role (detail panel only — intentional). Tests:
+   `graph/classify_test.go`.
+4. **Post-scan decay cliff** — 60s after a scan, all one-packet nodes/edges
+   died in ONE sweep → mass removal delta + reheat. **Fixed:** staggered
+   decay — each 10s sweep removes at most `maxNodeRemovalsPerSweep=50` nodes
+   / `maxEdgeRemovalsPerSweep=100` edges, stalest first; eligibility
+   unchanged. A 500-node scan corpse fades over ~100s in gentle waves.
+   Tests: `graph/decay_test.go`.
+5. **Fixed 100ms tick with no burst pacing** — **Fixed:** adaptive pacing in
+   `server/websocket.go`. The fixed ticker is now a `time.Timer` re-armed at
+   tick completion (slow ticks stretch the cadence naturally; coalescing
+   preserved). Interval from the tick EMA: `<50ms → 100ms`,
+   `50–80ms → 200ms`, `>80ms → 500ms` ceiling; step-up immediate, step-down
+   only after the EMA holds the lower band for `pacingHysteresis=2s`;
+   transitions logged once. The idle and layout-busy paths inherit the
+   cadence automatically. Message formats and slow-consumer disconnect
+   unchanged. Tests: `server/websocket_test.go` (`TestPacingBand`,
+   `TestTickPacer`).
+
+### Dev harness
+
+`-synth-burst N` (with `-synth` only): 15s in, scanner `10.254.0.1` sweeps N
+fresh hosts (10.254.b.c space) evenly over 5s — one-packet edges, then quiet.
+Repeatable NMAP-shaped spike for before/after measurement.
+
+### Measured (before → after; 2 WS clients)
+
+Scenario `-synth 150 -synth-rate 2000 -synth-burst 100` (stays under the
+aggregation threshold, so the raw churn hits the view directly):
+
+- **Position-frame bytes during the 5s sweep: 373.6KB → 99.3KB (~73% cut).**
+  Before: every node re-heated, positions for all ~250 nodes shipped every
+  tick. After: only the ~100 newcomers move; 150 elders frozen byte-exact.
+- **Post-sweep:** before ships another 113.7KB of cooling tail; after ships
+  one 105.5KB reheat (the designed single re-balance) — then both go silent
+  (0KB pos) in steady state via the settle-gate.
+- Steady-state wire is dominated by the flow-particle feed (~60 flows/tick
+  cap, ~110KB/s/client at 2000 pkt/s at 10Hz) — intentional, keeps the
+  display alive; adaptive pacing (fix 5) is the knob that stretches it under
+  real overload.
+
+Scenario `-synth 500 -synth-rate 5000 -synth-burst 1000`, 3 clients: tick EMA
+~11.6ms pre-burst, ~16ms during (before) vs ~16.2ms during settling back to
+~11.9ms (after) — aggregation already masks node churn at that scale; the
+hysteresis (fix 2) is what prevents threshold flap there. Pacing never
+engaged in any test (EMA < 50ms): headroom insurance for larger views/more
+clients, covered by unit tests.

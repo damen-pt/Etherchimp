@@ -121,9 +121,22 @@ func scanPcapMetadata(filename string) (PcapInfo, error) {
 
 // NewReader creates a new pcap replay reader
 func NewReader(filename string) (*Reader, error) {
+	return NewReaderFiltered(filename, "")
+}
+
+// NewReaderFiltered is NewReader with an optional libpcap BPF filter (e.g. the
+// -net subnet filter) applied before packets are loaded, so non-matching packets
+// never enter the graph.
+func NewReaderFiltered(filename, bpf string) (*Reader, error) {
 	handle, err := pcap.OpenOffline(filename)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open pcap file: %v", err)
+	}
+	if bpf != "" {
+		if err := handle.SetBPFFilter(bpf); err != nil {
+			handle.Close()
+			return nil, fmt.Errorf("failed to apply filter %q: %v", bpf, err)
+		}
 	}
 
 	reader := &Reader{

@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log"
 	mrand "math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,11 +31,16 @@ import (
 func main() {
 	// Parse command-line flags
 	iface := flag.String("i", "", "Network interface to capture from, or 'any' for all interfaces (required for capture mode)")
+	ifaceFilter := flag.String("interface-filter", "", "CIDR (e.g. 192.168.0.0/16); capture on every local interface holding an IP in this subnet. Local-capture only; mutually exclusive with -i/-f/-ssh/-synth")
+	netFilter := flag.String("net", "", "Subnet CIDR(s) to keep, comma-separated (e.g. 192.168.1.0/24,10.0.0.0/8). Kernel BPF 'net' filter: only packets touching one of these subnets are recorded to the pcap and shown in the graph. Combinable with -i/-f/-ssh; slims captures in large environments")
+	nodeTTL := flag.Int("node-ttl", 60, "Seconds a node/edge may go silent before it decays out of the graph (raise for bursty traffic)")
 	replayFile := flag.String("f", "", "Pcap file path for replay-only mode (disables live capture)")
 	synthCount := flag.Int("synth", 0, "DEV: serve a synthetic graph of N hosts with continuous random traffic (no capture; for scale testing)")
 	synthRate := flag.Int("synth-rate", 2000, "DEV: synthetic packets per second (with -synth)")
+	synthBurst := flag.Int("synth-burst", 0, "DEV: with -synth, ~15s in simulate an NMAP-style scan of N fresh hosts from a single scanner IP (one packet per host, then quiet)")
 	port := flag.Int("p", 8443, "HTTPS server port")
 	bindIP := flag.String("ip", "0.0.0.0", "IP address to bind server to")
+	protocolsPath := flag.String("protocols", "protocols.json", "Protocol catalog JSON (created with the embedded defaults if missing)")
 	daemonCmd := flag.String("daemon", "", "Daemon command: start, stop, pause, resume, status, rotate-logs, log-status, cleanup-logs")
 	background := flag.Bool("background", false, "Run in background (internal use)")
 
@@ -67,6 +74,21 @@ func main() {
 
 	flag.Parse()
 
+	// Protocol catalog: load the user-editable JSON if present; if missing,
+	// materialize the embedded defaults there for the user to edit. A malformed
+	// file logs a warning and falls back to the embedded defaults.
+	if _, err := os.Stat(*protocolsPath); os.IsNotExist(err) {
+		if err := os.WriteFile(*protocolsPath, capture.DefaultProtocolsJSON(), 0644); err != nil {
+			log.Printf("  Protocol catalog: embedded defaults (could not write %s: %v)", *protocolsPath, err)
+		} else {
+			log.Printf("  Protocol catalog: embedded defaults (wrote editable copy to %s)", *protocolsPath)
+		}
+	} else if err := capture.LoadProtocols(*protocolsPath); err != nil {
+		log.Printf("  Warning: failed to load protocol catalog %s: %v (using embedded defaults)", *protocolsPath, err)
+	} else {
+		log.Printf("  Protocol catalog: %s", *protocolsPath)
+	}
+
 	// Build log rotation config from flags
 	logRotateConfig := buildLogRotateConfig(*logMaxSize, *logMaxBackups, *logMaxAge, *logCompress, *logCheckInterval)
 
@@ -98,6 +120,51 @@ func main() {
 	replayOnlyMode := *replayFile != ""
 	sshCaptureMode := *sshHost != ""
 	synthMode := *synthCount > 0
+
+	// -interface-filter is a local-capture alternative to -i: it selects every
+	// local interface whose IP falls inside the given CIDR (handy when an
+	// interface carries several IPs). It needs local pcap.FindAllDevs, so it is
+	// mutually exclusive with -i/-f/-ssh/-synth.
+	var filterDevices []string
+	if *ifaceFilter != "" {
+		if *iface != "" || replayOnlyMode || sshCaptureMode || synthMode {
+			fmt.Println("Error: -interface-filter cannot be combined with -i, -f, -ssh, or -synth")
+			os.Exit(1)
+		}
+		_, cidr, err := net.ParseCIDR(*ifaceFilter)
+		if err != nil {
+			log.Fatalf("Invalid -interface-filter CIDR %q: %v", *ifaceFilter, err)
+		}
+		filterDevices = devicesInCIDR(cidr)
+		if len(filterDevices) == 0 {
+			log.Fatalf("No local interface has an IP within %s.\n%s", *ifaceFilter, availableInterfacesMsg())
+		}
+		log.Printf("  Interface filter %s matched: %s", *ifaceFilter, strings.Join(filterDevices, ", "))
+	}
+
+	// -net is a packet-content subnet filter (BPF "net" expression), applied in
+	// the kernel so non-matching packets never reach the pcap writer or the graph.
+	// Unlike -interface-filter (which selects NICs by their own IP), it works with
+	// -i any and any single interface, and also narrows -f replay / -ssh capture.
+	var netBPF string
+	if *netFilter != "" {
+		if synthMode {
+			fmt.Println("Error: -net cannot be combined with -synth (synthetic mode captures no packets)")
+			os.Exit(1)
+		}
+		expr, err := buildNetBPF(*netFilter)
+		if err != nil {
+			log.Fatalf("Invalid -net value %q: %v", *netFilter, err)
+		}
+		netBPF = expr
+		log.Printf("  Subnet filter: %s  (BPF: %s)", *netFilter, netBPF)
+	}
+
+	// -synth-burst rides the synthetic graph; alone it means nothing.
+	if *synthBurst > 0 && !synthMode {
+		fmt.Println("Error: -synth-burst requires -synth (the scan burst targets the synthetic graph)")
+		os.Exit(1)
+	}
 
 	// Validate flags based on mode
 	if synthMode {
@@ -148,10 +215,11 @@ func main() {
 			}
 		}
 	} else {
-		// Local capture mode: -i is required
-		if *iface == "" {
+		// Local capture mode: -i or -interface-filter is required
+		if *iface == "" && *ifaceFilter == "" {
 			fmt.Println("Error: One of the following is required:")
 			fmt.Println("  -i: Network interface for live capture mode")
+			fmt.Println("  -interface-filter: CIDR selecting local interfaces by IP")
 			fmt.Println("  -f: Pcap file for replay-only mode")
 			fmt.Println("  -ssh: SSH host for remote capture mode (requires -i, -user, and -pkey or -pass)")
 			flag.Usage()
@@ -159,8 +227,10 @@ func main() {
 		}
 
 		// Validate the interface exists. "any" is a special value (listen on all
-		// interfaces) and is not a real device, so it skips this check.
-		if *iface != "any" {
+		// interfaces) and is not a real device, so it skips this check. When
+		// -interface-filter is used, *iface is empty and the device list is
+		// already resolved above, so this check is skipped too.
+		if *iface != "" && *iface != "any" {
 			devices, err := pcap.FindAllDevs()
 			if err != nil {
 				log.Fatalf("Failed to enumerate network interfaces: %v", err)
@@ -190,6 +260,11 @@ func main() {
 	// Initialize stream manager (track last 1000 streams)
 	streamMgr := stream.NewManager(1000)
 
+	// Stream tracking runs on its own goroutine (fed by a bounded channel) so
+	// its per-packet work doesn't sit on the ingest hot path. Started once,
+	// before any mode branch below can call processPacket.
+	streamCh := startStreamFeeder(ctx, streamMgr)
+
 	// Optional persistence backend. A nil *store.Store is valid everywhere
 	// downstream (all methods no-op), so no call site needs to guard on -db.
 	var db *store.Store
@@ -218,9 +293,12 @@ func main() {
 		// SYNTHETIC MODE (dev): no capture, generated topology + traffic.
 		log.Printf("Starting etherchimp in SYNTHETIC mode...")
 		log.Printf("  Hosts: %d, rate: %d pkt/s", *synthCount, *synthRate)
+		if *synthBurst > 0 {
+			log.Printf("  Scan burst: %d hosts (fires ~%v in)", *synthBurst, synthBurstDelay)
+		}
 		log.Printf("  Server: https://%s:%d", *bindIP, *port)
 		captureID = beginCaptureSession(db, "synth", fmt.Sprintf("synth-%d", *synthCount), store.FileMeta{})
-		go runSynthetic(ctx, graphMgr, *synthCount, *synthRate, db, captureID)
+		go runSynthetic(ctx, graphMgr, *synthCount, *synthRate, *synthBurst, db, captureID)
 	} else if replayOnlyMode {
 		// REPLAY-ONLY MODE
 		log.Printf("Starting etherchimp in REPLAY-ONLY mode...")
@@ -228,10 +306,13 @@ func main() {
 		log.Printf("  Server: https://%s:%d", *bindIP, *port)
 
 		// Pcap cache: if this exact file was fully ingested before, load the
-		// stored aggregates instead of re-parsing packet by packet.
+		// stored aggregates instead of re-parsing packet by packet. A -net filter
+		// bypasses the cache entirely: the stored aggregates are the full file, so
+		// reusing them would ignore the filter, and storing a filtered (partial)
+		// run would poison the cache for later unfiltered replays.
 		cacheHit := false
 		var meta store.FileMeta
-		if db.Enabled() {
+		if db.Enabled() && netBPF == "" {
 			var err error
 			meta, err = store.ComputeFileMeta(*replayFile)
 			if err != nil {
@@ -253,7 +334,7 @@ func main() {
 
 		if !cacheHit {
 			// Load the initial pcap file and populate the graph
-			reader, err := replay.NewReader(*replayFile)
+			reader, err := replay.NewReaderFiltered(*replayFile, netBPF)
 			if err != nil {
 				log.Fatalf("Failed to load replay file: %v", err)
 			}
@@ -272,7 +353,7 @@ func main() {
 
 			// Populate graph with all packets
 			for _, pwt := range allPackets {
-				processPacket(pwt.Info, pwt.Timestamp, graphMgr, streamMgr, nil, db, ingestID, true)
+				processPacket(pwt.Info, pwt.Timestamp, graphMgr, streamCh, nil, db, ingestID, true)
 			}
 
 			if ingestID != 0 {
@@ -305,7 +386,7 @@ func main() {
 		dnsResolver.Start(ctx)
 
 		// Start decay manager
-		decayMgr := graph.NewDecayManager(graphMgr, 60) // 60 second timeout
+		decayMgr := graph.NewDecayManager(graphMgr, *nodeTTL) // -node-ttl seconds
 		decayMgr.Start(ctx)
 
 		// Initialize SSH packet capture
@@ -316,6 +397,7 @@ func main() {
 			PrivateKey: *sshPrivateKey,
 			Username:   *sshUser,
 			Password:   *sshPass,
+			Filter:     netBPF,
 		}
 		sshCaptureEngine, err := capture.NewSSHCapture(sshConfig, packetChan)
 		if err != nil {
@@ -356,14 +438,18 @@ func main() {
 				case <-ctx.Done():
 					return
 				case pkt := <-packetChan:
-					processPacket(pkt, time.Now(), graphMgr, streamMgr, dnsResolver, db, captureID, false)
+					processPacket(pkt, time.Now(), graphMgr, streamCh, dnsResolver, db, captureID, false)
 				}
 			}
 		}()
 	} else {
 		// LOCAL CAPTURE MODE (original behavior)
 		log.Printf("Starting etherchimp...")
-		log.Printf("  Interface: %s", *iface)
+		if *ifaceFilter != "" {
+			log.Printf("  Interface filter: %s (%s)", *ifaceFilter, strings.Join(filterDevices, ", "))
+		} else {
+			log.Printf("  Interface: %s", *iface)
+		}
 		log.Printf("  Server: https://%s:%d", *bindIP, *port)
 		log.Printf("  Stream tracking: enabled")
 
@@ -372,14 +458,25 @@ func main() {
 		dnsResolver.Start(ctx)
 
 		// Start decay manager
-		decayMgr := graph.NewDecayManager(graphMgr, 60) // 60 second timeout
+		decayMgr := graph.NewDecayManager(graphMgr, *nodeTTL) // -node-ttl seconds
 		decayMgr.Start(ctx)
 
 		// Initialize packet capture
 		packetChan := make(chan *capture.PacketInfo, 1000)
-		captureEngine, err := capture.NewCapture(*iface, packetChan)
+		var captureEngine *capture.Capture
+		var err error
+		if *ifaceFilter != "" {
+			captureEngine, err = capture.NewCaptureOnDevices(filterDevices, packetChan)
+		} else {
+			captureEngine, err = capture.NewCapture(*iface, packetChan)
+		}
 		if err != nil {
 			log.Fatalf("Failed to initialize packet capture: %v", err)
+		}
+		if netBPF != "" {
+			if err := captureEngine.SetBPFFilter(netBPF); err != nil {
+				log.Fatalf("Failed to apply -net filter: %v", err)
+			}
 		}
 
 		// Setup signal handlers for pause/resume
@@ -407,7 +504,11 @@ func main() {
 		// Start packet capture
 		go captureEngine.Start(ctx)
 
-		captureID = beginCaptureSession(db, "live", *iface, store.FileMeta{})
+		liveSource := *iface
+		if *ifaceFilter != "" {
+			liveSource = "filter:" + *ifaceFilter
+		}
+		captureID = beginCaptureSession(db, "live", liveSource, store.FileMeta{})
 
 		// Process packets and update graph
 		go func() {
@@ -416,7 +517,7 @@ func main() {
 				case <-ctx.Done():
 					return
 				case pkt := <-packetChan:
-					processPacket(pkt, time.Now(), graphMgr, streamMgr, dnsResolver, db, captureID, false)
+					processPacket(pkt, time.Now(), graphMgr, streamCh, dnsResolver, db, captureID, false)
 				}
 			}
 		}()
@@ -555,14 +656,14 @@ func buildLogRotateConfig(maxSize string, maxBackups, maxAge int, compress bool,
 }
 
 // processPacket is the single packet ingest path shared by local capture, SSH
-// capture, and pcap replay: hostname resolution, graph/stream updates, and the
-// optional persistence hook. It runs outside the graph Manager's lock and sees
-// raw endpoint IDs before DNS merging mutates them, which is exactly what the
-// store's aggregates need. dnsResolver is nil in replay mode. syncIndex makes
-// the packet-index write blocking (complete index) instead of best-effort —
-// only offline ingest (replay) should set it.
+// capture, and pcap replay: hostname resolution, graph updates, a handoff to
+// stream tracking, and the optional persistence hook. It runs outside the
+// graph Manager's lock and sees raw endpoint IDs before DNS merging mutates
+// them, which is exactly what the store's aggregates need. dnsResolver is nil
+// in replay mode. syncIndex makes the packet-index write blocking (complete
+// index) instead of best-effort — only offline ingest (replay) should set it.
 func processPacket(pkt *capture.PacketInfo, ts time.Time, graphMgr *graph.Manager,
-	streamMgr *stream.Manager, dnsResolver *graph.DNSResolver, db *store.Store, captureID int64, syncIndex bool) {
+	streamCh chan<- *capture.PacketInfo, dnsResolver *graph.DNSResolver, db *store.Store, captureID int64, syncIndex bool) {
 	// Resolve hostnames asynchronously. Endpoints without a resolvable IP
 	// (e.g. L2 topology nodes) carry a friendly name on the packet, which
 	// takes precedence over DNS.
@@ -580,8 +681,14 @@ func processPacket(pkt *capture.PacketInfo, ts time.Time, graphMgr *graph.Manage
 	// the hot path instead of five.
 	graphMgr.Ingest(pkt, srcHostname, dstHostname)
 
-	// Add packet to stream tracking
-	streamMgr.AddPacket(pkt)
+	// Hand the packet to stream tracking without blocking ingest. If the
+	// stream goroutine falls behind (queue full), drop the packet from stream
+	// tracking only — graph and DB above are unaffected — and count it.
+	select {
+	case streamCh <- pkt:
+	default:
+		noteStreamDrop()
+	}
 
 	if captureID != 0 {
 		ev := store.PacketEvent{
@@ -603,6 +710,42 @@ func processPacket(pkt *capture.PacketInfo, ts time.Time, graphMgr *graph.Manage
 		} else {
 			db.RecordPacket(ev)
 		}
+	}
+}
+
+// startStreamFeeder moves stream tracking off the ingest goroutine: ingest
+// does a non-blocking send (see processPacket) and this goroutine owns every
+// Manager.AddPacket call. The channel is never closed — on ctx cancel the
+// goroutine returns and queued packets are simply dropped (streams are
+// best-effort telemetry, not correctness-critical).
+func startStreamFeeder(ctx context.Context, mgr *stream.Manager) chan<- *capture.PacketInfo {
+	ch := make(chan *capture.PacketInfo, 4096)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case pkt := <-ch:
+				mgr.AddPacket(pkt)
+			}
+		}
+	}()
+	return ch
+}
+
+// Stream-drop accounting: a total counter, plus a time check so the overflow
+// log line is emitted at most once every 5 seconds no matter how bad the
+// backlog gets.
+var (
+	streamDrops       atomic.Uint64
+	streamDropLastLog atomic.Int64 // unix seconds
+)
+
+func noteStreamDrop() {
+	n := streamDrops.Add(1)
+	now := time.Now().Unix()
+	if last := streamDropLastLog.Load(); now-last >= 5 && streamDropLastLog.CompareAndSwap(last, now) {
+		log.Printf("Stream tracking falling behind: %d packets dropped (queue full)", n)
 	}
 }
 
@@ -641,6 +784,74 @@ func beginCaptureSession(db *store.Store, kind, source string, meta store.FileMe
 	return id
 }
 
+// devicesInCIDR returns the names of local capture devices that have at least
+// one IP address inside cidr. pcap.FindAllDevs already exposes each device's
+// addresses; we simply filter on containment. Duplicate names are avoided since
+// FindAllDevs yields each device once.
+// buildNetBPF turns a comma-separated list of CIDRs into a libpcap "net" filter
+// expression (e.g. "192.168.1.0/24,10.0.0.0/8" -> "net 192.168.1.0/24 or net
+// 10.0.0.0/8"). A packet matches if either endpoint falls in any listed subnet.
+// Returns an error if any entry is not a valid CIDR.
+func buildNetBPF(list string) (string, error) {
+	var terms []string
+	for _, p := range strings.Split(list, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(p); err != nil {
+			return "", fmt.Errorf("%q is not a valid CIDR: %v", p, err)
+		}
+		terms = append(terms, "net "+p)
+	}
+	if len(terms) == 0 {
+		return "", fmt.Errorf("no CIDR provided")
+	}
+	return strings.Join(terms, " or "), nil
+}
+
+func devicesInCIDR(cidr *net.IPNet) []string {
+	devices, err := pcap.FindAllDevs()
+	if err != nil {
+		log.Fatalf("Failed to enumerate network interfaces: %v", err)
+	}
+	var matched []string
+	for _, dev := range devices {
+		for _, addr := range dev.Addresses {
+			if addr.IP != nil && cidr.Contains(addr.IP) {
+				matched = append(matched, dev.Name)
+				break
+			}
+		}
+	}
+	return matched
+}
+
+// availableInterfacesMsg formats the local interfaces and their IPs for error
+// messages, so a failed -interface-filter tells the user what was available.
+func availableInterfacesMsg() string {
+	devices, err := pcap.FindAllDevs()
+	if err != nil {
+		return fmt.Sprintf("(could not enumerate interfaces: %v)", err)
+	}
+	var b strings.Builder
+	b.WriteString("Available interfaces:")
+	for _, dev := range devices {
+		var ips []string
+		for _, addr := range dev.Addresses {
+			if addr.IP != nil {
+				ips = append(ips, addr.IP.String())
+			}
+		}
+		if len(ips) == 0 {
+			fmt.Fprintf(&b, "\n  %s (no IP)", dev.Name)
+		} else {
+			fmt.Fprintf(&b, "\n  %s: %s", dev.Name, strings.Join(ips, ", "))
+		}
+	}
+	return b.String()
+}
+
 // flagSlice implements flag.Value for collecting multiple flag values
 type flagSlice []string
 
@@ -658,7 +869,9 @@ func (f *flagSlice) Set(value string) error {
 // without a capture (-synth N). Hosts are laid out 10.a.b.c across /16s and
 // /24s so the hierarchical subnet aggregation sees realistic structure: each
 // /24 has a "rack hub" (.0) its hosts talk to, hubs talk across subnets.
-func runSynthetic(ctx context.Context, graphMgr *graph.Manager, n, pktRate int, db *store.Store, captureID int64) {
+// burstN > 0 (-synth-burst) additionally fires an NMAP-style scan burst ~15s
+// after seeding (see synthScanBurst).
+func runSynthetic(ctx context.Context, graphMgr *graph.Manager, n, pktRate, burstN int, db *store.Store, captureID int64) {
 	recordSynth := func(src, dst string, proto capture.Protocol, size int) {
 		if captureID == 0 {
 			return
@@ -696,6 +909,9 @@ func runSynthetic(ctx context.Context, graphMgr *graph.Manager, n, pktRate int, 
 		}
 	}
 	log.Printf("  Synthetic graph seeded: %d hosts across %d /24s", n, (n+perSubnet-1)/perSubnet)
+	if burstN > 0 {
+		go synthScanBurst(ctx, graphMgr, burstN, recordSynth)
+	}
 
 	// Continuous traffic: mostly intra-rack (host <-> its hub), some hub-to-hub
 	// chatter across subnets so inter-subnet edges exist at every level. Edge
@@ -742,4 +958,49 @@ func runSynthetic(ctx context.Context, graphMgr *graph.Manager, n, pktRate int, 
 			}
 		}
 	}
+}
+
+// synthBurstDelay / synthBurstDuration shape the -synth-burst scan: the sweep
+// starts once the steady-state graph has settled, and the N targets are hit
+// evenly across the burst window.
+const (
+	synthBurstDelay    = 15 * time.Second
+	synthBurstDuration = 5 * time.Second
+)
+
+// synthScanBurst is a dev harness (-synth-burst N, valid only with -synth) that
+// simulates an NMAP-style scan: after synthBurstDelay, a single scanner IP
+// touches N fresh hosts over ~synthBurstDuration — one or two graph updates
+// (scanner→host, TCP, one small packet) per target — and then goes quiet. The
+// targets are one-packet wonders, exactly like a scan, so the graph suddenly
+// gains N nodes and edges that never speak again.
+//
+// Targets live in 10.254.x.x, /24s the steady-state seeding never uses (hosts
+// are 10.a.b.c with a = (i/65536)%256, so a only reaches 254 past ~16.6M
+// seeded hosts — far beyond any load-test scale).
+func synthScanBurst(ctx context.Context, graphMgr *graph.Manager, n int, recordSynth func(src, dst string, proto capture.Protocol, size int)) {
+	const scannerIP = "10.254.0.1"
+	timer := time.NewTimer(synthBurstDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	log.Printf("  Synth burst: scanner %s sweeping %d hosts over ~%v", scannerIP, n, synthBurstDuration)
+	interval := synthBurstDuration / time.Duration(n)
+	for i := 0; i < n; i++ {
+		if ctx.Err() != nil {
+			return
+		}
+		// One fresh target per /24 octet pair, .1-.254 (skip .0/.255 like the
+		// steady-state seeding does); wraps harmlessly if N exceeds the space.
+		target := fmt.Sprintf("10.254.%d.%d", (i/254)%255+1, i%254+1)
+		graphMgr.AddOrUpdateNode(scannerIP, scannerIP, 60)
+		graphMgr.AddOrUpdateNode(target, target, 60)
+		graphMgr.AddOrUpdateEdge(scannerIP, target, capture.ProtocolTCP, 60)
+		recordSynth(scannerIP, target, capture.ProtocolTCP, 60)
+		time.Sleep(interval)
+	}
+	log.Printf("  Synth burst: sweep complete, scanner quiet (%d hosts touched)", n)
 }

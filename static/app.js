@@ -1,5 +1,8 @@
-// Protocol color mapping (must match server-side capture/protocols.go)
-const PROTOCOL_COLORS = {
+// Protocol color mapping — built-in fallback copy of the server-side defaults
+// (capture/protocols.json). At startup loadProtocolCatalog() replaces these
+// tables with the server's /api/protocols response; they are only used when
+// that fetch fails.
+let PROTOCOL_COLORS = {
     'TCP': '#3498db',
     'UDP': '#2ecc71',
     'ICMP': '#f39c12',
@@ -43,9 +46,10 @@ const PROTOCOL_COLORS = {
     'Other': '#ecf0f1'
 };
 
-// OSI layer grouping for the legend/filters (must match server-side LayerNum).
+// OSI layer grouping for the legend/filters (fallback; replaced by the
+// server catalog's layer labels at startup).
 // Order here controls display order: top (L2) to bottom (L7).
-const PROTOCOL_LAYERS = [
+let PROTOCOL_LAYERS = [
     { label: 'L2 · Data Link', protocols: ['ARP', 'VLAN', 'LLDP', 'CDP', 'STP'] },
     { label: 'L3 · Network', protocols: ['ICMP', 'NDP', 'IGMP', 'OSPF', 'IPv6'] },
     { label: 'L4 · Transport', protocols: ['TCP', 'UDP'] },
@@ -55,14 +59,49 @@ const PROTOCOL_LAYERS = [
     { label: '— · Other', protocols: ['Other'] }
 ];
 
-// Protocols shown by default. Everything else starts filtered out (checkbox
-// unchecked) so the initial graph shows only general host-to-host traffic;
-// topology, routing, and zero-config discovery noise (mDNS, SSDP, LLMNR, …)
-// stay hidden until the user checks them to include that traffic.
-const DEFAULT_VISIBLE_PROTOCOLS = new Set([
+// Protocols shown by default (fallback; replaced by the server catalog's
+// defaultVisible flags at startup). Everything else starts filtered out
+// (checkbox unchecked) so the initial graph shows only general host-to-host
+// traffic; topology, routing, and zero-config discovery noise (mDNS, SSDP,
+// LLMNR, …) stay hidden until the user checks them to include that traffic.
+let DEFAULT_VISIBLE_PROTOCOLS = new Set([
     'ICMP', 'TCP', 'UDP', 'HTTP', 'HTTPS', 'DNS'
     // K8s · Cluster (VXLAN/Geneve/K8s-API/etcd/Kubelet) stays off by default.
 ]);
+
+// Fetch the server's protocol catalog and rebuild the color map, layer
+// grouping, and default-visible set from it. Falls back to the hardcoded
+// tables above when the endpoint is unreachable or returns garbage.
+async function loadProtocolCatalog() {
+    try {
+        const resp = await fetch('/api/protocols');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const protocols = await resp.json();
+        if (!Array.isArray(protocols) || protocols.length === 0) {
+            throw new Error('empty catalog');
+        }
+        const colors = {};
+        const layers = [];
+        const layerIndex = {};
+        const visible = new Set();
+        protocols.forEach(p => {
+            colors[p.name] = p.color;
+            if (p.defaultVisible) visible.add(p.name);
+            let group = layerIndex[p.layer];
+            if (!group) {
+                group = { label: p.layer, protocols: [] };
+                layerIndex[p.layer] = group;
+                layers.push(group);
+            }
+            group.protocols.push(p.name);
+        });
+        PROTOCOL_COLORS = colors;
+        PROTOCOL_LAYERS = layers;
+        DEFAULT_VISIBLE_PROTOCOLS = visible;
+    } catch (e) {
+        console.warn('Using built-in protocol tables; /api/protocols failed:', e);
+    }
+}
 
 // Global state
 let network = null;
@@ -123,10 +162,15 @@ let lastEdgeSig = new Map(); // id -> render signature string
 let lastHoverNodeId = null;
 let detailsNodeId = null;
 
-// Phase 4 subnet aggregation: /24 CIDRs the user expanded back into hosts.
-// Mirrors the server's per-client ExpandedSubnets (we initiate every change and
-// re-sync the full set on connect, so the two can't drift).
+// Phase 4/6 subnet aggregation: pin-opened CIDRs (budgeted expand), fully
+// expanded CIDRs (no residual "+N more"), and optional isolate focus.
+// Mirrors the server's per-client state (we initiate every change and re-sync
+// the full set on connect, so the two can't drift).
 let expandedSubnets = new Set();
+let fullExpandSubnets = new Set();
+let focusClusterCIDR = '';
+let currentZoomBand = ''; // '' | 'far' | 'mid' | 'near'
+let zoomBandTimer = null;
 
 // The performance tier currently applied to the network options; re-applied via
 // network.setOptions only when the node count crosses a tier boundary.
@@ -205,9 +249,12 @@ let replayMode = {
 };
 
 // Initialize the application
-function init() {
+async function init() {
     initSearchWorker();
     loadOverrides();
+    // Load the server-driven protocol catalog before building the legend/filter
+    // UI (colors, layer grouping, default-visible set).
+    await loadProtocolCatalog();
     setupNetwork();
     setupLegend();
     setupDropdowns();
@@ -376,7 +423,8 @@ function setupNetwork() {
         (rendererParam !== 'gl' && !wantCosmos && stored === 'vis');
     if (wantCosmos && window.CosmosNetwork && CosmosNetwork.isSupported()) {
         network = new CosmosNetwork(container, data, options);
-        console.log('Renderer: cosmos.gl (GPU force layout)');
+        network.isCosmos = true;
+        console.log('Renderer: cosmos.gl (solar-system explorer, server layout)');
     } else if (!wantVis && window.GLNetwork && GLNetwork.isSupported()) {
         network = new GLNetwork(container, data, options);
         console.log('Renderer: WebGL (GLNetwork)' + (wantCosmos ? ' [cosmos unavailable]' : ''));
@@ -457,7 +505,13 @@ function setupNetwork() {
     });
     network.on('blurEdge', hideGraphTooltip);
     network.on('dragStart', hideGraphTooltip);
-    network.on('zoom', hideGraphTooltip);
+    network.on('zoom', function(params) {
+        hideGraphTooltip();
+        const scale = (params && params.scale != null)
+            ? params.scale
+            : (network.getScale ? network.getScale() : 1);
+        reportZoomBand(scale);
+    });
 }
 
 // --- Lazy graph tooltip --------------------------------------------------------
@@ -859,6 +913,59 @@ function setupHeaderToggle() {
 }
 
 // Setup search functionality
+// Display-filter completions offered as greyed-out ghost text. Kept in sync
+// with the server-side grammar in graph/filter.go.
+const FILTER_SUGGESTIONS = [
+    'ip.addr == ', 'ip.src == ', 'ip.dst == ',
+    'eth.addr == ', 'tcp.port == ', 'udp.port == ',
+    'host contains ', 'hostname == ', 'dns.qry.name contains ', 'frame contains ',
+    'and ', 'or ', 'not ',
+    'tcp', 'udp', 'dns', 'http', 'https', 'tls', 'icmp', 'arp', 'ssh',
+];
+
+// computeGhostSuffix returns the dimmed completion for the token currently being
+// typed (the run of non-space, non-paren characters at the end of value), or ''.
+function computeGhostSuffix(value) {
+    if (!value) return '';
+    const m = value.match(/[^\s()]*$/);
+    const frag = m ? m[0] : '';
+    if (!frag) return '';
+    const lf = frag.toLowerCase();
+    for (const s of FILTER_SUGGESTIONS) {
+        if (s.length > frag.length && s.toLowerCase().startsWith(lf)) {
+            return s.slice(frag.length);
+        }
+    }
+    return '';
+}
+
+// updateSearchGhost renders the ghost overlay aligned with the input text.
+function updateSearchGhost() {
+    const input = document.getElementById('searchInput');
+    const ghost = document.getElementById('searchGhost');
+    if (!input || !ghost) return;
+    const value = input.value;
+    const suffix = (document.activeElement === input) ? computeGhostSuffix(value) : '';
+    input._ghostSuffix = suffix;
+    if (!suffix) { ghost.textContent = ''; return; }
+    // Align the overlay with the input box (offsets are relative to the
+    // position:relative .search-bar parent).
+    ghost.style.left = input.offsetLeft + 'px';
+    ghost.style.top = input.offsetTop + 'px';
+    ghost.style.width = input.offsetWidth + 'px';
+    ghost.style.height = input.offsetHeight + 'px';
+    ghost.style.lineHeight = input.offsetHeight + 'px';
+    const hidden = document.createElement('span');
+    hidden.style.visibility = 'hidden';
+    hidden.textContent = value;
+    const suf = document.createElement('span');
+    suf.className = 'ghost-suffix';
+    suf.textContent = suffix;
+    ghost.textContent = '';
+    ghost.appendChild(hidden);
+    ghost.appendChild(suf);
+}
+
 function setupSearch() {
     const searchInput = document.getElementById('searchInput');
     const searchClear = document.getElementById('searchClear');
@@ -871,6 +978,7 @@ function setupSearch() {
 
         // Show/hide clear button
         searchClear.style.display = query ? 'flex' : 'none';
+        updateSearchGhost();
 
         // Debounce search
         clearTimeout(searchTimeout);
@@ -882,6 +990,24 @@ function setupSearch() {
         searchTimeout = setTimeout(() => {
             performSearch(query);
         }, 300);
+    });
+
+    // Accept the ghost completion with Tab or Right-arrow (at end of input).
+    searchInput.addEventListener('keydown', function(e) {
+        const suffix = searchInput._ghostSuffix;
+        const atEnd = searchInput.selectionStart === searchInput.value.length &&
+                      searchInput.selectionStart === searchInput.selectionEnd;
+        if (suffix && (e.key === 'Tab' || (e.key === 'ArrowRight' && atEnd))) {
+            e.preventDefault();
+            searchInput.value += suffix;
+            searchInput._ghostSuffix = '';
+            updateSearchGhost();
+            searchInput.dispatchEvent(new Event('input'));
+        }
+    });
+    searchInput.addEventListener('blur', function() {
+        const ghost = document.getElementById('searchGhost');
+        if (ghost) ghost.textContent = '';
     });
 
     // Handle clear button
@@ -907,6 +1033,9 @@ function setupSearch() {
             searchInput.value = '';
             searchClear.style.display = 'none';
             searchResults.classList.remove('show');
+            searchInput._ghostSuffix = '';
+            const g = document.getElementById('searchGhost');
+            if (g) g.textContent = '';
         }
     });
 }
@@ -1235,11 +1364,24 @@ async function fetchNodeDetail(nodeId) {
         const m = nodeMeta.get(nodeId);
         if (!m) return null; // node left the view while fetching
         m.ips = d.ips;
+        m.macs = d.macs || [];
+        m.primaryMac = d.primaryMac || (m.macs[0] || '');
         m.deviceInfo = d.deviceInfo;
+        m.vendor = d.vendor;
+        m.deviceClass = d.deviceClass;
         m.role = m.role || d.role;
         m.peers = d.peers;
         m.detailEdges = d.edges;
         m.detailLoaded = true;
+        // Keep cosmos planet labels in sync (name + IP under the node).
+        if (network && network.body && network.body.nodes[nodeId]) {
+            const o = network.body.nodes[nodeId].options;
+            o.ips = m.ips || [];
+            o.macs = m.macs || [];
+            o.primaryMac = m.primaryMac || '';
+            o.hostname = m.label || o.hostname;
+            if (typeof network._updateLabels === 'function') network._updateLabels();
+        }
         return m;
     } catch (e) {
         return meta;
@@ -1340,31 +1482,46 @@ function displaySearchResults(results, query) {
 
     // Add click handlers for result items
     searchResults.querySelectorAll('.search-result-item').forEach(item => {
-        item.addEventListener('click', function() {
+        item.addEventListener('click', async function() {
             const nodeId = this.getAttribute('data-node-id');
             const packetIdsStr = this.getAttribute('data-packet-ids');
+            const packetPanel = document.getElementById('packetPanel');
 
-            // If this result has packet matches, open packet panel and select first packet
             if (packetIdsStr) {
-                const packetIds = packetIdsStr.split(',').map(id => parseInt(id));
-
-                // Open packet panel
-                const packetPanel = document.getElementById('packetPanel');
+                // Payload match: open the inspector on the MOST RECENT matching
+                // packet (highest id), not the oldest one in the list.
+                const packetIds = packetIdsStr.split(',')
+                    .map(id => parseInt(id)).filter(n => !isNaN(n));
                 if (!packetPanel.classList.contains('show')) {
                     packetPanel.classList.add('show');
-                    // Load packets when opening panel via search
                     loadPackets();
                 }
-
-                // Select the first matching packet
                 if (packetIds.length > 0) {
-                    setTimeout(() => {
-                        selectPacket(packetIds[0]);
-                    }, 100);
+                    const mostRecent = Math.max(...packetIds);
+                    setTimeout(() => selectPacket(mostRecent), 100);
                 }
+            } else if (nodeId) {
+                // Plain node/text result: open the packet inspector on the
+                // node's most recent packet (with payload), not just the
+                // details sidebar. Falls back silently to the sidebar if the
+                // node has no packet in the live buffer.
+                try {
+                    const resp = await fetch('/api/packet/recent?node=' + encodeURIComponent(nodeId));
+                    if (resp.ok) {
+                        const pkt = await resp.json();
+                        if (pkt && pkt.id != null) {
+                            packetCache.set(pkt.id, pkt);
+                            if (!packetPanel.classList.contains('show')) {
+                                packetPanel.classList.add('show');
+                                loadPackets();
+                            }
+                            showPacketInspector(pkt);
+                        }
+                    }
+                } catch (e) { /* no recent packet; sidebar below still opens */ }
             }
 
-            // Also focus on the node in the graph
+            // Also focus on the node in the graph (and show details sidebar).
             focusOnNode(nodeId);
 
             clearSearch();
@@ -2108,24 +2265,99 @@ function sendFilters() {
     sendControl({ type: 'setFilters', data: { hidden: [...protocolFilters] } });
 }
 
-// Sync the full Phase 4 aggregation state: activation threshold (0 = server
-// default of 300 hosts; override via localStorage.aggThreshold) and the set of
-// expanded /24s. Idempotent, so it's safe to resend on reconnect.
+// Sync Phase 4/6 aggregation state: threshold, budgeted expands, full expands,
+// isolate focus, and zoom band. Idempotent — safe to resend on reconnect.
 function sendAggregation() {
     const threshold = parseInt(localStorage.getItem('aggThreshold') || '0', 10) || 0;
-    sendControl({ type: 'setAggregation', data: { threshold: threshold, expanded: [...expandedSubnets] } });
+    sendControl({
+        type: 'setAggregation',
+        data: {
+            threshold: threshold,
+            expanded: [...expandedSubnets],
+            fullExpand: [...fullExpandSubnets],
+            focus: focusClusterCIDR || '',
+            zoomBand: currentZoomBand || ''
+        }
+    });
+    updateFocusClusterBadge();
 }
 
-// Expand a collapsed subnet supernode into its member hosts / collapse it back.
+// Expand a collapsed subnet supernode into its member hosts (budgeted) /
+// collapse it back. Residual "+N more" tails call handleSubnetExpandAll.
 function handleSubnetExpand(cidr) {
-    expandedSubnets.add(cidr);
+    // Strip residual suffix if the user clicked a tail node.
+    const base = (cidr || '').replace(/\+$/, '');
+    expandedSubnets.add(base);
+    sendAggregation();
+    hideDetails();
+}
+// Reveal every host in a CIDR (bypass expand budget residual).
+function handleSubnetExpandAll(cidr) {
+    const base = (cidr || '').replace(/\+$/, '');
+    expandedSubnets.add(base);
+    fullExpandSubnets.add(base);
     sendAggregation();
     hideDetails();
 }
 function handleSubnetCollapse(cidr) {
-    expandedSubnets.delete(cidr);
+    const base = (cidr || '').replace(/\+$/, '');
+    expandedSubnets.delete(base);
+    fullExpandSubnets.delete(base);
+    if (focusClusterCIDR === base || focusClusterCIDR === base + '+') {
+        focusClusterCIDR = '';
+    }
     sendAggregation();
     hideDetails();
+}
+// Isolate the view to a single cluster (raise caps, hide outsiders).
+function handleClusterFocus(cidr) {
+    const base = (cidr || '').replace(/\+$/, '');
+    focusClusterCIDR = base;
+    expandedSubnets.add(base);
+    sendAggregation();
+    hideDetails();
+}
+function handleClusterFocusExit() {
+    focusClusterCIDR = '';
+    sendAggregation();
+}
+function updateFocusClusterBadge() {
+    let badge = document.getElementById('focusClusterBadge');
+    if (!focusClusterCIDR) {
+        if (badge) badge.remove();
+        return;
+    }
+    if (!badge) {
+        badge = document.createElement('div');
+        badge.id = 'focusClusterBadge';
+        badge.style.cssText = 'position:fixed;bottom:18px;left:50%;transform:translateX(-50%);' +
+            'z-index:40;padding:8px 14px;border-radius:8px;background:rgba(25,30,40,0.92);' +
+            'color:#7ec8ff;font:13px system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,0.35);' +
+            'display:flex;gap:12px;align-items:center;';
+        document.body.appendChild(badge);
+    }
+    badge.innerHTML = `<span>Focusing <strong>${focusClusterCIDR}</strong></span>` +
+        `<button type="button" style="cursor:pointer;border:0;border-radius:6px;padding:4px 10px;` +
+        `background:#3a4a60;color:#fff;font:12px system-ui,sans-serif;" ` +
+        `onclick="handleClusterFocusExit()">Show all</button>`;
+}
+
+// Map camera scale -> semantic zoom band for server aggregation LOD.
+function zoomBandFromScale(scale) {
+    if (!(scale > 0)) return 'mid';
+    if (scale < 0.35) return 'far';
+    if (scale > 1.4) return 'near';
+    return 'mid';
+}
+function reportZoomBand(scale) {
+    const band = zoomBandFromScale(scale);
+    if (band === currentZoomBand) return;
+    currentZoomBand = band;
+    if (zoomBandTimer) clearTimeout(zoomBandTimer);
+    zoomBandTimer = setTimeout(() => {
+        zoomBandTimer = null;
+        sendAggregation();
+    }, 280);
 }
 
 // The /24 CIDR for a host node's primary IPv4 address ('' when not IPv4).
@@ -2202,15 +2434,21 @@ function connectWebSocket() {
         // Sync our filter set, layout mode and aggregation state so the
         // server's view of this client matches the UI (and survives reconnects).
         sendFilters();
-        sendLayout(localStorage.getItem('clusterLayout') || 'force');
+        // Cosmos explorer prefers the server solar-system layout (stable planets).
+        let layout = localStorage.getItem('clusterLayout') || 'force';
+        if (network && network.isCosmos) {
+            layout = 'solar';
+            localStorage.setItem('clusterLayout', 'solar');
+        }
+        sendLayout(layout);
         sendAggregation();
         // Restore timeline mode across reconnects (module at end of file).
         if (typeof timeline !== 'undefined' && timeline.active) {
             sendTimelinePosition(true);
         }
-        // Raw-scale mode (?scale=raw, cosmos renderer only): ask the server to
-        // stream the full unaggregated topology as binary frames.
-        if (network && network.ownsLayout &&
+        // Legacy raw-scale mode (?scale=raw): full unaggregated topology frames.
+        // Default cosmos path uses styled solar layout + position frames instead.
+        if (network && network.isCosmos &&
             new URLSearchParams(window.location.search).get('scale') === 'raw') {
             sendControl({ type: 'setViewMode', data: { mode: 'raw' } });
         }
@@ -2316,8 +2554,21 @@ function applyRawTopologyFrame(buf) {
 // needed); anything else becomes a target for the 60fps easing loop.
 // Returns 'moved' | 'snapped' | null for the caller to aggregate.
 function applyTargetPosition(id, x, y, pinned, bodyNodes) {
+    // Ignore no-op / sub-pixel noise so settled solar layouts don't keep the
+    // easing loop warm under traffic (looks like random hopping).
+    const prevT = nodeTargetPos.get(id);
+    if (prevT && !pinned) {
+        const ddx = prevT.x - x, ddy = prevT.y - y;
+        if (ddx * ddx + ddy * ddy < 0.25) {
+            return null;
+        }
+    }
     nodeTargetPos.set(id, { x: x, y: y });
-    if (pinned || !nodeRenderPos.has(id)) {
+    // Solar / cosmos: snap to server coords — easing was fighting stable orbits
+    // and read as jitter when frames re-sent nearly-identical positions.
+    const snapLayout = pinned || (network && network.isCosmos) ||
+        currentClusterLayout === 'solar';
+    if (snapLayout || !nodeRenderPos.has(id)) {
         nodeRenderPos.set(id, { x: x, y: y });
         const bn = bodyNodes[id];
         if (bn && (bn.x !== x || bn.y !== y)) {
@@ -2356,7 +2607,17 @@ function applyPositionFrame(buf) {
     wireStats.posFrames++;
     wireStats.posNodes += count;
     if (moved) startPositionAnimation();
-    else if (snapped && network) network.redraw();
+    else if (snapped && network) {
+        // Cosmos snaps write body.x/y but the GPU points+links only move when
+        // _posDirty is set; a bare redraw() would leave dots/edges frozen at the
+        // stale seed position while labels/glow (read from body) drift to the
+        // real spot — the "unlinked" look. Mirror the JSON delta path.
+        if (network.isCosmos && typeof network.markSceneDirty === 'function') {
+            network.markSceneDirty('nodes');
+        } else {
+            network.redraw();
+        }
+    }
 }
 
 // Merge a 1s counts frame into the meta maps (tooltips/details/search read
@@ -2531,6 +2792,14 @@ const SUBNET_NODE_COLOR = {
     highlight: { border: '#3b82f6', background: 'rgba(59, 130, 246, 0.55)' }
 };
 
+// Residual "+N more" after budgeted expand (Phase 6): warmer blue so it reads
+// as "more traffic / hosts still hidden" rather than a quiet collapsed box.
+const SUBNET_TAIL_COLOR = {
+    border: '#c2410c',
+    background: 'rgba(251, 146, 60, 0.40)',
+    highlight: { border: '#ea580c', background: 'rgba(251, 146, 60, 0.60)' }
+};
+
 // Map a server-computed traffic tier (0..3) to a theme-aware vis color object.
 // The server decides the tier; the client only resolves the palette so theme
 // toggling stays instant without a round-trip.
@@ -2567,6 +2836,7 @@ function tierColor(tier, isLightTheme) {
 // color (Phase D) wins; group nodes get the muted palette; otherwise the tier.
 function viewNodeColor(node, isLightTheme) {
     if (node.color) return node.color; // user override wins
+    if (node.isTail) return SUBNET_TAIL_COLOR;
     if (node.isSubnet) return SUBNET_NODE_COLOR;
     if (node.isGroup) return GROUP_NODE_COLOR;
     if (nodeColorMode === 'role') return roleColor(node.role);
@@ -2728,11 +2998,21 @@ function updateGraph(data) {
         const label = formatNodeLabel(node);
         const shape = viewNodeShape(node);
         const color = viewNodeColor(node, isLight);
-        // Quantize the size driver to ~5% steps: node size only spans 20..30px, so
-        // sub-5% growth is invisible and shouldn't trigger a restyle.
-        const valueQ = Math.round(Math.log((node.value || 0) + 1) * 20);
-        const sig = label + '~' + shape + '~' + valueQ + '~' + (node.isGroup ? 1 : 0) +
-            '~' + (node.role || '') + '~' + JSON.stringify(color);
+        // Cosmo solar: freeze size driver — traffic-driven valueQ changes were
+        // restyling hundreds of nodes/sec and made planets "breathe"/jank.
+        // Map mode keeps finer quant for responsive sizing.
+        const valueQ = (network && network.isCosmos)
+            ? Math.round(Math.log((node.value || 0) + 1) * 4)  // coarse buckets
+            : Math.round(Math.log((node.value || 0) + 1) * 20);
+        // Cosmos: ignore size/tier in signature after first paint so only
+        // label/topology/protocol-role changes hit the DataSet.
+        const sig = (network && network.isCosmos)
+            ? (label + '~' + shape + '~' + (node.isGroup ? 1 : 0) +
+                '~' + (node.isSubnet ? 1 : 0) + '~' + (node.isTail ? 1 : 0) +
+                '~' + (node.role || '') + '~' + (color && color.background))
+            : (label + '~' + shape + '~' + valueQ + '~' + (node.isGroup ? 1 : 0) +
+                '~' + (node.isSubnet ? 1 : 0) + '~' + (node.isTail ? 1 : 0) +
+                '~' + (node.hostCount || 0) + '~' + (node.role || '') + '~' + JSON.stringify(color));
         if (lastNodeSig.get(node.id) === sig && nodes.get(node.id)) {
             continue; // data-only change; meta map already updated
         }
@@ -2747,6 +3027,7 @@ function updateGraph(data) {
             hostname: node.label,
             isGroup: node.isGroup,
             isSubnet: node.isSubnet,
+            isTail: node.isTail,
             hostCount: node.hostCount,
             role: node.role,
             packetCount: node.packetCount,
@@ -2758,12 +3039,13 @@ function updateGraph(data) {
             shapeProperties: node.isGroup ? { borderDashes: [4, 4] } : { borderDashes: false },
             font: node.isGroup ? { color: '#95a5a6' } : null
         };
-        // Always carry the current RENDERED position so a style update re-applies
-        // the position the node is actually at (vis re-applies item x/y on update;
-        // a stale stored position would teleport the node).
+        // Cosmo: seed x/y only on first insert — restyles must not re-push
+        // coordinates (DataSet updates were teleporting planets under traffic).
         if (renderPos) {
-            nodeData.x = renderPos.x;
-            nodeData.y = renderPos.y;
+            if (!(network && network.isCosmos) || !nodes.get(node.id)) {
+                nodeData.x = renderPos.x;
+                nodeData.y = renderPos.y;
+            }
         }
         nodeUpdates.push(nodeData);
     }
@@ -2772,8 +3054,13 @@ function updateGraph(data) {
     }
     if (movedTargets) {
         startPositionAnimation();
-    } else if (snappedBody && network) {
+    } else if (snappedBody && network && !(network.isCosmos)) {
+        // Cosmo snaps are already written to body; avoid redraw storms on
+        // multi-chunk full snapshots.
         network.redraw();
+    } else if (snappedBody && network && network.isCosmos && typeof network.markSceneDirty === 'function') {
+        // Single coalesced position push after a burst of seeds.
+        network.markSceneDirty('nodes');
     }
 
     // Build vis edges from server-styled ViewEdges. Hidden edges are already
@@ -2783,9 +3070,19 @@ function updateGraph(data) {
     const edgeUpdates = [];
     for (const edge of incomingEdges) {
         edgeMeta.set(edge.id, edge);
-        const label = edgeLabelsVisible ? formatEdgeLabel(edge) : '';
-        const width = Math.round((Math.log(edge.packetCount + 1) * 0.5 + 1) * 4) / 4;
-        const sig = edge.from + '~' + edge.to + '~' + edge.protocol.Color + '~' + width + '~' + label;
+        const protoName = (edge.protocol && edge.protocol.Name) || 'Other';
+        const protoColor = (edge.protocol && edge.protocol.Color) ||
+            PROTOCOL_COLORS[protoName] || '#95a5a6';
+        // Protocol name on the link (Slurm, SSH, …) — same as WebGL intent.
+        const label = edgeLabelsVisible ? (protoName || formatEdgeLabel(edge)) : '';
+        // Prefer server-computed width (Phase 7); fall back to local log scale.
+        // Cosmos freezes width after first paint (traffic width thrash = jank).
+        const width = typeof edge.width === 'number'
+            ? Math.round(edge.width * 4) / 4
+            : Math.round((Math.log(edge.packetCount + 1) * 0.5 + 1) * 4) / 4;
+        const sig = (network && network.isCosmos)
+            ? (edge.from + '~' + edge.to + '~' + protoColor + '~' + protoName)
+            : (edge.from + '~' + edge.to + '~' + protoColor + '~' + width + '~' + label);
         if (lastEdgeSig.get(edge.id) === sig && edges.get(edge.id)) {
             continue; // data-only change; meta map already updated
         }
@@ -2795,9 +3092,9 @@ function updateGraph(data) {
             from: edge.from,
             to: edge.to,
             label: label,
-            color: { color: edge.protocol.Color },
+            color: { color: protoColor },
             width: width,
-            protocol: edge.protocol,
+            protocol: edge.protocol || { Name: protoName, Color: protoColor },
             packetCount: edge.packetCount,
             byteCount: edge.byteCount
         });
@@ -2995,7 +3292,15 @@ function stepPositionAnimation() {
         if (bn) { bn.x = r.x; bn.y = r.y; moved = true; }
         moving = true;
     });
-    if (moved) network.redraw();
+    if (moved) {
+        // GL path: mark node buffers dirty so instance positions re-upload;
+        // camera-only pans stay cheap via dirty flags in glrenderer.js.
+        if (typeof network.markSceneDirty === 'function') {
+            network.markSceneDirty('nodes');
+        } else {
+            network.redraw();
+        }
+    }
     if (moving && !hidden) {
         requestAnimationFrame(stepPositionAnimation);
     } else {
@@ -3042,7 +3347,11 @@ function applyFocusDim() {
             opts.color.opacity = (!focusActive || focusKeepEdges.has(id)) ? 1 : 0.06;
         }
     }
-    network.redraw();
+    if (typeof network.markSceneDirty === 'function') {
+        network.markSceneDirty('all');
+    } else {
+        network.redraw();
+    }
 }
 
 // --- Traffic flow particles ---------------------------------------------------
@@ -3053,9 +3362,9 @@ function applyFocusDim() {
 // separate rAF loop — the Safari-friendly path); the 2D overlay below remains
 // as the vis-network fallback.
 function feedFlowParticles(flows) {
-    // cosmos.gl mode: positions live on the GPU; neither the GL particle scene
-    // nor the 2D overlay can follow them, so particles are off (v1).
-    if (network && network.ownsLayout) return;
+    // Legacy GPU-sim cosmos could not track particles; solar explorer uses
+    // server positions and implements spawnParticles.
+    if (network && network.ownsLayout && typeof network.spawnParticles !== 'function') return;
     // Gate on traffic volume: quiet flows spawn nothing (the graph should not
     // be a snow globe), and speed encodes intensity.
     const significant = flows.filter(f => (f.packets || 0) >= FLOW_MIN_PACKETS);
@@ -3232,15 +3541,17 @@ function recolorAllNodes() {
     }
 }
 
-// The shape for a node: groups and collapsed subnets are boxes; every real
-// (connected) host is a circle. Role is conveyed by color/legend, not shape.
+// Circles for hosts, subnets, and tails — boxes read as a "weird square"
+// artifact. Only pure protocol group rendezvous keep a soft box.
 function viewNodeShape(node) {
-    return (node.isGroup || node.isSubnet) ? 'box' : 'dot';
+    if (node.isGroup && !node.isSubnet && !node.isTail) return 'box';
+    return 'dot';
 }
 
 // Format node label. The role is encoded by node shape now, so the label stays
 // clean (no glyph prefix); the glyph still appears in tooltips/details.
 function formatNodeLabel(node) {
+    if (node.isTail) return node.label || `+${node.hostCount || '?'} more`;
     if (node.isSubnet) return `${node.label} (${node.hostCount})`;
     return node.label !== node.id ? node.label : node.id;
 }
@@ -3248,6 +3559,15 @@ function formatNodeLabel(node) {
 // Format node tooltip
 function formatNodeTooltip(node) {
     let tooltip = '';
+
+    // Residual "+N more" after budgeted expand.
+    if (node.isTail) {
+        tooltip += `⋯ +${node.hostCount || '?'} quieter hosts in this subnet\n`;
+        tooltip += `CIDR: ${(node.label || node.id || '').replace(/^\+\d+ more in /, '')}\n`;
+        tooltip += `Packets: ${node.packetCount}\nBytes: ${formatBytes(node.byteCount)}\n`;
+        tooltip += `Click → Expand all hosts`;
+        return tooltip;
+    }
 
     // Collapsed /24 supernode: summary + how to open it.
     if (node.isSubnet) {
@@ -3270,6 +3590,12 @@ function formatNodeTooltip(node) {
     // LLDP/CDP hardware details (port you're connected to, mgmt address).
     if (node.deviceInfo) {
         tooltip += `Link: ${node.deviceInfo}\n`;
+    }
+    // Maker + device type from the MAC's IEEE OUI (e.g. "LG Electronics · TV / media").
+    if (node.vendor) {
+        tooltip += `Device: ${node.vendor}${node.deviceClass ? ' · ' + node.deviceClass : ''}\n`;
+    } else if (node.deviceClass) {
+        tooltip += `Device: ${node.deviceClass}\n`;
     }
 
     // Display hostname if different from ID
@@ -3297,11 +3623,11 @@ function formatNodeTooltip(node) {
     return tooltip;
 }
 
-// Format edge label. Protocol name only: embedding the live packet count meant
-// every packet changed the label, forcing a text re-render of ~every edge on
-// every update under load. Counts live in the tooltip and details panel.
+// Format edge label. Protocol name only (Slurm, SSH, HTTPS…): embedding the
+// live packet count meant every packet changed the label. Counts stay in
+// tooltips/details. Matches WebGL + cosmos explorer.
 function formatEdgeLabel(edge) {
-    return edge.protocol.Name;
+    return (edge.protocol && edge.protocol.Name) || edge.protocolName || '';
 }
 
 // Format edge tooltip (bidirectional)
@@ -3352,7 +3678,11 @@ function showNodeDetails(nodeId) {
             byteCount: meta.byteCount,
             role: meta.role,
             deviceInfo: meta.deviceInfo,
-            ips: meta.ips || node.ips
+            vendor: meta.vendor,
+            deviceClass: meta.deviceClass,
+            ips: meta.ips || node.ips,
+            macs: meta.macs || node.macs,
+            primaryMac: meta.primaryMac || node.primaryMac
         });
     }
     // Slim stream: IPs/deviceInfo/connections come from /api/node on demand.
@@ -3376,29 +3706,49 @@ function showNodeDetails(nodeId) {
 
     detailsPanel.classList.add('active');
 
-    // Collapsed subnet supernode (Phase 4/5, /24 or /16): summary + expand,
-    // plus re-collapse of the parent /16 when viewing a /24 inside one.
-    if (node.isSubnet) {
-        const cidr = (node.hostname || nodeId).replace(/'/g, "\\'");
-        const parent16 = cidr.endsWith('/24') ? subnet16Of(cidr) : '';
+    // Collapsed / residual subnet supernode (Phase 4–6): expand, expand-all,
+    // isolate focus, plus re-collapse of the parent /16 when viewing a /24.
+    if (node.isSubnet || node.isTail) {
+        const rawId = (node.id || nodeId || '');
+        const baseCidr = (node.isTail
+            ? (rawId.replace(/\+$/, '') || (node.hostname || '').replace(/^\+\d+ more in /, ''))
+            : (node.hostname || nodeId)).replace(/'/g, "\\'");
+        const parent16 = baseCidr.endsWith('/24') ? subnet16Of(baseCidr) : '';
         const collapseParentHTML = (parent16 && expandedSubnets.has(parent16))
             ? `<button class="group-toggle-btn" onclick="handleSubnetCollapse('${parent16}')">⊟ Collapse ${parent16}</button>`
             : '';
+        const title = node.isTail ? 'More Hosts in Subnet' : 'Subnet Details';
+        const expandBtn = node.isTail
+            ? `<button class="group-toggle-btn" onclick="handleSubnetExpandAll('${baseCidr}')">⊞ Expand all hosts</button>`
+            : `<button class="group-toggle-btn" onclick="handleSubnetExpand('${baseCidr}')">⊞ Expand subnet</button>
+               <button class="group-toggle-btn" onclick="handleSubnetExpandAll('${baseCidr}')">⊞ Expand all</button>`;
         detailsContent.innerHTML = `
-            <h4>Subnet Details</h4>
-            <div class="detail-item"><strong>CIDR:</strong> ${node.hostname || nodeId}</div>
-            <div class="detail-item"><strong>Hosts inside:</strong> ${node.hostCount || '?'}</div>
+            <h4>${title}</h4>
+            <div class="detail-item"><strong>CIDR:</strong> ${baseCidr}</div>
+            <div class="detail-item"><strong>Hosts inside:</strong> ${node.hostCount || '?'}${node.isTail ? ' (quieter remainder)' : ''}</div>
             <div class="detail-item"><strong>Total Packets:</strong> ${node.packetCount || 0}</div>
             <div class="detail-item"><strong>Total Bytes:</strong> ${formatBytes(node.byteCount || 0)}</div>
             <div class="detail-item"><strong>Active Connections:</strong> ${connectedEdges.length}</div>
             <div class="customize-buttons">
-                <button class="group-toggle-btn" onclick="handleSubnetExpand('${cidr}')">⊞ Expand subnet</button>
+                ${expandBtn}
+                <button class="group-toggle-btn" onclick="handleClusterFocus('${baseCidr}')">◎ Focus cluster</button>
                 ${collapseParentHTML}
             </div>`;
         return;
     }
 
-    // Format IP addresses
+    // MAC is the forensic ground truth when known (exclusive host MAC).
+    const macs = node.macs || [];
+    const primaryMac = node.primaryMac || macs[0] || '';
+    let macHTML = '';
+    if (primaryMac) {
+        macHTML = `<div class="detail-item"><strong>MAC (identity):</strong> <code>${primaryMac}</code></div>`;
+        if (macs.length > 1) {
+            macHTML += `<div class="detail-item"><strong>All MACs:</strong> ${macs.map(m => `<code>${m}</code>`).join(', ')}</div>`;
+        }
+    }
+
+    // Format IP addresses (nodes may be multi-homed / k8s multi-IP)
     let ipAddressHTML = '';
     if (node.ips && node.ips.length > 0) {
         if (node.ips.length === 1) {
@@ -3418,8 +3768,10 @@ function showNodeDetails(nodeId) {
                 ipAddressHTML = `<strong>IP Addresses:</strong> ${node.ips.join(', ')}`;
             }
         }
-    } else {
+    } else if (!primaryMac) {
         ipAddressHTML = `<strong>IP Address:</strong> ${nodeId}`;
+    } else {
+        ipAddressHTML = `<strong>IP Address:</strong> <em>loading…</em>`;
     }
 
     // Format hostname (only show if different from node ID)
@@ -3435,6 +3787,16 @@ function showNodeDetails(nodeId) {
     const deviceHTML = node.deviceInfo
         ? `<div class="detail-item"><strong>Link:</strong> ${node.deviceInfo}</div>`
         : '';
+    // Vendor + device type inferred from the MAC's IEEE OUI (LG TV, Linksys
+    // router, Rockwell PLC, …). Vendor is authoritative; class is a best-effort
+    // hint, so it's shown parenthetically.
+    let vendorHTML = '';
+    if (node.vendor) {
+        const cls = node.deviceClass ? ` <span style="color:var(--text-muted)">(${escapeHtml(node.deviceClass)})</span>` : '';
+        vendorHTML = `<div class="detail-item"><strong>Device:</strong> ${escapeHtml(node.vendor)}${cls}</div>`;
+    } else if (node.deviceClass) {
+        vendorHTML = `<div class="detail-item"><strong>Device:</strong> <span style="color:var(--text-muted)">${escapeHtml(node.deviceClass)}</span></div>`;
+    }
 
     // Per-node customization editor (server-backed, persisted, shared). Auto
     // multicast/broadcast groups are inherent and not editable as groups.
@@ -3481,9 +3843,40 @@ function showNodeDetails(nodeId) {
         }
     }
 
+    // Prefer live graph edges; fall back to /api/node edge summary (cosmos/raw).
+    let connectionsHTML = '';
+    if (connectedEdges.length) {
+        connectionsHTML = connectedEdges.map(edge => `
+                <div class="connection-item">
+                    <span class="color-box" style="background-color: ${edge.color.color}"></span>
+                    ${edge.from === nodeId ? '→ ' + edge.to : '← ' + edge.from}
+                    (${edge.protocol.Name})
+                </div>`).join('');
+    } else if (meta && meta.detailEdges && meta.detailEdges.length) {
+        connectionsHTML = meta.detailEdges.map(e => `
+                <div class="connection-item">
+                    <span class="color-box" style="background-color: ${e.color || '#888'}"></span>
+                    ${e.outbound ? '→ ' : '← '}${e.peer}
+                    (${e.protocol}) · ${e.packetCount} pkts
+                </div>`).join('');
+    } else {
+        connectionsHTML = '<div class="connection-item"><em>No active connections in view</em></div>';
+    }
+    const connCount = connectedEdges.length || (meta && meta.detailEdges ? meta.detailEdges.length : 0)
+        || (meta && meta.peers) || 0;
+
+    // Packet inspector shortcut for forensics.
+    const packetsBtn = (!node.isSubnet && !node.isGroup)
+        ? `<div class="customize-buttons">
+             <button class="group-toggle-btn" onclick="inspectNodePackets('${escId}')">◫ Recent packets</button>
+           </div>`
+        : '';
+
     detailsContent.innerHTML = `
         <h4>Node Details</h4>
         ${hostnameHTML}
+        ${macHTML}
+        ${vendorHTML}
         ${roleHTML}
         ${deviceHTML}
         <div class="detail-item">
@@ -3491,6 +3884,7 @@ function showNodeDetails(nodeId) {
         </div>
         ${subnetHTML}
         ${customizeHTML}
+        ${packetsBtn}
         <div class="detail-item">
             <strong>Total Packets:</strong> ${node.packetCount || 0}
         </div>
@@ -3498,19 +3892,30 @@ function showNodeDetails(nodeId) {
             <strong>Total Bytes:</strong> ${formatBytes(node.byteCount || 0)}
         </div>
         <div class="detail-item">
-            <strong>Active Connections:</strong> ${connectedEdges.length}
+            <strong>Active Connections:</strong> ${connCount}
         </div>
         <h5>Connections:</h5>
         <div class="connections-list">
-            ${connectedEdges.map(edge => `
-                <div class="connection-item">
-                    <span class="color-box" style="background-color: ${edge.color.color}"></span>
-                    ${edge.from === nodeId ? '→ ' + edge.to : '← ' + edge.from}
-                    (${edge.protocol.Name})
-                </div>
-            `).join('')}
+            ${connectionsHTML}
         </div>
     `;
+}
+
+// Open the most recent packet involving this node (forensic path).
+async function inspectNodePackets(nodeId) {
+    try {
+        const resp = await fetch('/api/packet/recent?node=' + encodeURIComponent(nodeId));
+        if (!resp.ok) {
+            alert('No recent packet buffered for this node');
+            return;
+        }
+        const pkt = await resp.json();
+        if (typeof showPacketInspector === 'function') {
+            showPacketInspector(pkt);
+        }
+    } catch (e) {
+        console.warn('packet fetch failed', e);
+    }
 }
 
 // Show edge details
@@ -3664,6 +4069,43 @@ function setupClusterLayout() {
             // Tell the server which layout to position nodes for.
             sendLayout(layout);
         });
+    });
+
+    setupViewModeToggle();
+}
+
+// Map (WebGL force/ops) vs Explore (Cosmos solar-system) mode. Switching
+// reloads so the correct renderer boots cleanly with its wire protocol.
+function setupViewModeToggle() {
+    const mapBtn = document.getElementById('mapModeBtn');
+    const exploreBtn = document.getElementById('exploreModeBtn');
+    if (!mapBtn || !exploreBtn) return;
+
+    const params = new URLSearchParams(window.location.search);
+    const stored = localStorage.getItem('renderer');
+    const isExplore = params.get('renderer') === 'cosmos' ||
+        (params.get('renderer') == null && stored === 'cosmos');
+
+    mapBtn.classList.toggle('active', !isExplore);
+    exploreBtn.classList.toggle('active', isExplore);
+
+    mapBtn.addEventListener('click', () => {
+        localStorage.setItem('renderer', 'gl');
+        localStorage.setItem('clusterLayout', 'force');
+        const url = new URL(window.location.href);
+        url.searchParams.delete('renderer');
+        url.searchParams.delete('scale');
+        window.location.href = url.toString();
+    });
+    exploreBtn.addEventListener('click', () => {
+        // Solar-system cosmos explorer: server layout, no GPU bounce, labels,
+        // packet details on click. Optional ?scale=raw still available manually.
+        localStorage.setItem('renderer', 'cosmos');
+        localStorage.setItem('clusterLayout', 'solar');
+        const url = new URL(window.location.href);
+        url.searchParams.set('renderer', 'cosmos');
+        url.searchParams.delete('scale');
+        window.location.href = url.toString();
     });
 }
 

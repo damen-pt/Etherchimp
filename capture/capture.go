@@ -14,13 +14,14 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
-	"github.com/google/gopacket/pcapgo"
 )
 
 // PacketInfo contains parsed packet information
 type PacketInfo struct {
 	SrcIP    string
 	DstIP    string
+	SrcMAC   string // Ethernet source MAC ("" if no Ethernet layer)
+	DstMAC   string // Ethernet destination MAC ("" if no Ethernet layer)
 	SrcPort  uint16
 	DstPort  uint16
 	Protocol Protocol
@@ -109,12 +110,12 @@ func isLocalOrMulticastIP(ip net.IP) bool {
 type Capture struct {
 	handles    []*pcap.Handle
 	packetChan chan *PacketInfo
-	pcapWriter *pcapgo.Writer
-	pcapFile   *os.File
+	pcap       *pcapWriter
 	pcapDir    string
 	enablePcap bool
 	mu         sync.Mutex
 	paused     bool
+	chanDrops  *dropCounter
 }
 
 // NewCapture creates a new packet capture instance. iface may be a single
@@ -149,18 +150,38 @@ func NewCapture(iface string, packetChan chan *PacketInfo) (*Capture, error) {
 		handles = append(handles, h)
 	}
 
+	return newCaptureFromHandles(handles, packetChan)
+}
+
+// NewCaptureOnDevices creates a capture that listens on exactly the named
+// interfaces (used by -interface-filter, which resolves a CIDR to a device
+// list). Devices that can't be opened are skipped; an error is returned only if
+// none could be opened.
+func NewCaptureOnDevices(names []string, packetChan chan *PacketInfo) (*Capture, error) {
+	handles := openInterfaces(names)
+	if len(handles) == 0 {
+		return nil, fmt.Errorf("could not open any of the filtered interfaces: %v", names)
+	}
+	return newCaptureFromHandles(handles, packetChan)
+}
+
+// newCaptureFromHandles builds a Capture from already-opened handles and applies
+// the shared pcap-saving policy (disabled when merging multiple handles, since
+// one pcap file can hold only one link-layer type).
+func newCaptureFromHandles(handles []*pcap.Handle, packetChan chan *PacketInfo) (*Capture, error) {
 	c := &Capture{
 		handles:    handles,
 		packetChan: packetChan,
 		pcapDir:    "pcaps",
 		enablePcap: true, // Enable pcap saving by default
+		chanDrops:  newDropCounter("packet channel"),
 	}
 
 	// One shared pcap file can only hold one link-layer type, so saving is only
 	// enabled when capturing from a single handle.
 	if len(handles) > 1 {
 		c.enablePcap = false
-		log.Printf("  pcap saving disabled in multi-interface 'any' mode (mixed link types)")
+		log.Printf("  pcap saving disabled in multi-interface mode (mixed link types)")
 	}
 
 	if c.enablePcap {
@@ -200,11 +221,28 @@ func openAllInterfaces() []*pcap.Handle {
 	return handles
 }
 
+// openInterfaces opens a live capture handle on each named interface. Devices
+// that can't be opened (no permission, virtual, down) are skipped with a
+// warning rather than aborting the whole capture.
+func openInterfaces(names []string) []*pcap.Handle {
+	var handles []*pcap.Handle
+	for _, name := range names {
+		h, err := pcap.OpenLive(name, 1600, true, pcap.BlockForever)
+		if err != nil {
+			log.Printf("  Skipping interface %s: %v", name, err)
+			continue
+		}
+		handles = append(handles, h)
+		log.Printf("  Listening on: %s", name)
+	}
+	return handles
+}
+
 // createPcapFile creates a new pcap file with timestamp
 func (c *Capture) createPcapFile() error {
-	// Close existing file if open
-	if c.pcapFile != nil {
-		c.pcapFile.Close()
+	// Close existing writer if open (flushes and closes the old file)
+	if c.pcap != nil {
+		c.pcap.Close()
 	}
 
 	// Generate filename with timestamp
@@ -217,15 +255,15 @@ func (c *Capture) createPcapFile() error {
 		return fmt.Errorf("failed to create pcap file: %v", err)
 	}
 
-	// Create pcap writer (single-handle mode only, so handles[0] is the source).
-	writer := pcapgo.NewWriter(file)
-	if err := writer.WriteFileHeader(1600, c.handles[0].LinkType()); err != nil {
+	// Create the buffered async pcap writer (single-handle mode only, so
+	// handles[0] is the source). The header is written synchronously inside.
+	pw, err := newPcapWriter(file, 1600, c.handles[0].LinkType())
+	if err != nil {
 		file.Close()
 		return fmt.Errorf("failed to write pcap header: %v", err)
 	}
 
-	c.pcapFile = file
-	c.pcapWriter = writer
+	c.pcap = pw
 
 	log.Printf("Created pcap file: %s", filename)
 	return nil
@@ -245,7 +283,13 @@ func (c *Capture) Start(ctx context.Context) {
 		wg.Add(1)
 		go func(h *pcap.Handle) {
 			defer wg.Done()
-			packets := gopacket.NewPacketSource(h, h.LinkType()).Packets()
+			// Lazy + NoCopy: layers are decoded on demand (packet.Layer(...)
+			// forces the decode) and the packet buffer is not copied. Anything
+			// retained past processing must be copied — see copyPayload in
+			// ProcessPacket and the enqueue copy in pcapWriter.WritePacket.
+			src := gopacket.NewPacketSource(h, h.LinkType())
+			src.DecodeOptions = gopacket.DecodeOptions{Lazy: true, NoCopy: true}
+			packets := src.Packets()
 			for {
 				select {
 				case <-ctx.Done():
@@ -269,14 +313,16 @@ func (c *Capture) Start(ctx context.Context) {
 		h.Close()
 	}
 	wg.Wait()
-	if c.pcapFile != nil {
-		c.pcapFile.Close()
+	if c.pcap != nil {
+		c.pcap.Close()
 		log.Println("Closed pcap file")
 	}
 }
 
 // decapOverlay returns the inner packet carried by a VXLAN/Geneve overlay frame
 // (the pod-to-pod packet for Kubernetes CNIs), or nil if it can't be decoded.
+// The name switch picks the overlay type; only protocols flagged Decap in the
+// catalog (VXLAN, Geneve) ever reach this function.
 func decapOverlay(packet gopacket.Packet, name string) gopacket.Packet {
 	udpLayer := packet.Layer(layers.LayerTypeUDP)
 	if udpLayer == nil {
@@ -321,8 +367,10 @@ func ProcessPacket(packet gopacket.Packet) *PacketInfo {
 
 	// Kubernetes overlay decapsulation: if this is a VXLAN/Geneve tunnel, process
 	// the inner (pod-to-pod) packet instead, so the graph shows the real cluster
-	// traffic and its endpoints rather than just node-to-node "VXLAN".
-	if protocol.Name == "VXLAN" || protocol.Name == "Geneve" {
+	// traffic and its endpoints rather than just node-to-node "VXLAN". The
+	// decision is driven by the catalog's Decap flag (only VXLAN and Geneve set
+	// it); decapOverlay then switches on the name to pick the overlay type.
+	if protocol.Decap {
 		if inner := decapOverlay(packet, protocol.Name); inner != nil {
 			if info := ProcessPacket(inner); info != nil {
 				return info
@@ -432,9 +480,22 @@ func ProcessPacket(packet gopacket.Packet) *PacketInfo {
 	}
 	// Note: ICMP and ARP don't have ports, so srcPort and dstPort will be 0
 
+	// Ethernet MACs, when present, let the graph anchor a host's identity across
+	// IP changes (see graph.recordMACLocked). Absent for link types without an
+	// Ethernet header.
+	var srcMAC, dstMAC string
+	if ethLayer := packet.Layer(layers.LayerTypeEthernet); ethLayer != nil {
+		if eth, ok := ethLayer.(*layers.Ethernet); ok {
+			srcMAC = eth.SrcMAC.String()
+			dstMAC = eth.DstMAC.String()
+		}
+	}
+
 	return &PacketInfo{
 		SrcIP:    srcIP,
 		DstIP:    dstIP,
+		SrcMAC:   srcMAC,
+		DstMAC:   dstMAC,
 		SrcPort:  srcPort,
 		DstPort:  dstPort,
 		Protocol: protocol,
@@ -462,51 +523,55 @@ func extractL2Endpoints(packet gopacket.Packet, protocol Protocol) (srcID, dstID
 
 	// LLDP/CDP advertise the neighbour's identity, role (switch/router), the port
 	// you're connected to, and a management address — the basis of a hardware map.
-	switch protocol.Name {
-	case "LLDP":
-		if info, ok := packet.Layer(layers.LayerTypeLinkLayerDiscoveryInfo).(*layers.LinkLayerDiscoveryInfo); ok {
-			if info.SysName != "" {
-				srcName = info.SysName
+	// Gated on the catalog's L2Endpoints flag (only LLDP and CDP set it); the
+	// per-protocol TLV parsing below stays name-switched.
+	if protocol.L2Endpoints {
+		switch protocol.Name {
+		case "LLDP":
+			if info, ok := packet.Layer(layers.LayerTypeLinkLayerDiscoveryInfo).(*layers.LinkLayerDiscoveryInfo); ok {
+				if info.SysName != "" {
+					srcName = info.SysName
+				}
+				caps := info.SysCapabilities
+				if caps.SystemCap.Router || caps.EnabledCap.Router {
+					deviceKind = "router"
+				} else if caps.SystemCap.Bridge || caps.EnabledCap.Bridge {
+					deviceKind = "switch"
+				}
+				var parts []string
+				if disc, ok := packet.Layer(layers.LayerTypeLinkLayerDiscovery).(*layers.LinkLayerDiscovery); ok {
+					if p := strings.TrimSpace(string(disc.PortID.ID)); p != "" {
+						parts = append(parts, "port "+p)
+					}
+				}
+				if a := mgmtIPString(info.MgmtAddress.Address); a != "" {
+					parts = append(parts, "mgmt "+a)
+				}
+				deviceInfo = strings.Join(parts, " · ")
 			}
-			caps := info.SysCapabilities
-			if caps.SystemCap.Router || caps.EnabledCap.Router {
-				deviceKind = "router"
-			} else if caps.SystemCap.Bridge || caps.EnabledCap.Bridge {
-				deviceKind = "switch"
-			}
-			var parts []string
-			if disc, ok := packet.Layer(layers.LayerTypeLinkLayerDiscovery).(*layers.LinkLayerDiscovery); ok {
-				if p := strings.TrimSpace(string(disc.PortID.ID)); p != "" {
+		case "CDP":
+			if cdp, ok := packet.Layer(layers.LayerTypeCiscoDiscoveryInfo).(*layers.CiscoDiscoveryInfo); ok {
+				if cdp.DeviceID != "" {
+					srcName = cdp.DeviceID
+				}
+				if cdp.Capabilities.L3Router {
+					deviceKind = "router"
+				} else if cdp.Capabilities.L2Switch {
+					deviceKind = "switch"
+				}
+				var parts []string
+				if p := strings.TrimSpace(cdp.PortID); p != "" {
 					parts = append(parts, "port "+p)
 				}
+				ips := cdp.MgmtAddresses
+				if len(ips) == 0 {
+					ips = cdp.Addresses
+				}
+				if len(ips) > 0 {
+					parts = append(parts, "mgmt "+ips[0].String())
+				}
+				deviceInfo = strings.Join(parts, " · ")
 			}
-			if a := mgmtIPString(info.MgmtAddress.Address); a != "" {
-				parts = append(parts, "mgmt "+a)
-			}
-			deviceInfo = strings.Join(parts, " · ")
-		}
-	case "CDP":
-		if cdp, ok := packet.Layer(layers.LayerTypeCiscoDiscoveryInfo).(*layers.CiscoDiscoveryInfo); ok {
-			if cdp.DeviceID != "" {
-				srcName = cdp.DeviceID
-			}
-			if cdp.Capabilities.L3Router {
-				deviceKind = "router"
-			} else if cdp.Capabilities.L2Switch {
-				deviceKind = "switch"
-			}
-			var parts []string
-			if p := strings.TrimSpace(cdp.PortID); p != "" {
-				parts = append(parts, "port "+p)
-			}
-			ips := cdp.MgmtAddresses
-			if len(ips) == 0 {
-				ips = cdp.Addresses
-			}
-			if len(ips) > 0 {
-				parts = append(parts, "mgmt "+ips[0].String())
-			}
-			deviceInfo = strings.Join(parts, " · ")
 		}
 	}
 
@@ -522,6 +587,31 @@ func mgmtIPString(addr []byte) string {
 }
 
 // Pause pauses packet capture
+// SetBPFFilter compiles and installs a libpcap BPF filter on every open handle,
+// so filtering happens in the kernel — packets that don't match never reach the
+// pcap writer or the graph channel (used by -net to slim a capture to one or
+// more subnets). Handles that reject the filter (rare, exotic link types) are
+// skipped with a warning; an error is returned only if no handle accepted it.
+func (c *Capture) SetBPFFilter(expr string) error {
+	if expr == "" {
+		return nil
+	}
+	applied := 0
+	var lastErr error
+	for _, h := range c.handles {
+		if err := h.SetBPFFilter(expr); err != nil {
+			lastErr = err
+			log.Printf("  Warning: BPF filter %q rejected on a handle: %v", expr, err)
+			continue
+		}
+		applied++
+	}
+	if applied == 0 {
+		return fmt.Errorf("BPF filter %q could not be applied to any interface: %v", expr, lastErr)
+	}
+	return nil
+}
+
 func (c *Capture) Pause() {
 	c.mu.Lock()
 	c.paused = true
@@ -546,12 +636,11 @@ func (c *Capture) isPaused() bool {
 
 // processPacket extracts information from a packet and sends it to the channel
 func (c *Capture) processPacket(packet gopacket.Packet) {
-	// Write packet to pcap file if enabled
-	if c.enablePcap && c.pcapWriter != nil {
+	// Queue the packet for async pcap writing if enabled (non-blocking; drops
+	// are counted and rate-limited-logged inside the writer)
+	if c.enablePcap && c.pcap != nil {
 		metadata := packet.Metadata()
-		if err := c.pcapWriter.WritePacket(metadata.CaptureInfo, packet.Data()); err != nil {
-			log.Printf("Warning: Failed to write packet to pcap: %v", err)
-		}
+		c.pcap.WritePacket(metadata.CaptureInfo, packet.Data())
 	}
 
 	// Process packet using shared function
@@ -565,5 +654,6 @@ func (c *Capture) processPacket(packet gopacket.Packet) {
 	case c.packetChan <- packetInfo:
 	default:
 		// Channel is full, drop packet to avoid blocking
+		c.chanDrops.add()
 	}
 }

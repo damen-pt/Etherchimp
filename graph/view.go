@@ -4,6 +4,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 
 	"etherchimp/capture"
 )
@@ -28,17 +29,53 @@ const (
 	// A /24 only collapses when it has at least this many visible hosts;
 	// smaller subnets stay as individual nodes.
 	minHostsToCollapse = 3
+
+	// Aggregation hysteresis: once the kept-host count crosses the aggregate
+	// threshold upward the view collapses into subnet supernodes, and it then
+	// STAYS collapsed until the count falls below threshold*(divisor-1)/divisor
+	// (5/6, i.e. ~250 at the 300 default). Without this band a traffic burst
+	// hovering around the threshold flips the display strategy (individual
+	// hosts <-> supernodes) every tick.
+	aggregateReexpandDivisor = 6
+
+	// incumbentBonus multiplies the effective traffic of nodes that were in the
+	// previous tick's kept set, but ONLY inside the top-N selection sort key —
+	// displayed counts never change. A node hovering at the boundary then no
+	// longer flaps in/out of the view on every tick; a challenger still needs
+	// >~10% more traffic to displace an incumbent (a bias, not a lock).
+	incumbentBonus = 1.1
+
+	// maxViewStates bounds the per-client view-state side table (see
+	// viewStateFor). Entries can't be removed on client disconnect (view.go
+	// has no disconnect hook), so on overflow the table is reset — hysteresis
+	// simply restarts for a tick.
+	maxViewStates = 64
+
+	// Phase 6: budgeted expand — when a user opens a dense CIDR, only the
+	// busiest ExpandBudget members become individual nodes; the quiet remainder
+	// stays as a residual "+N more" supernode (id = cidr+"+"). Prevents a single
+	// expand from dumping hundreds of hosts into the force layout.
+	DefaultExpandBudget = 120
+
+	// Isolate-mode caps: when FocusCIDR is set the view only shows that cluster
+	// and may raise the element budget so drill-down stays useful.
+	DefaultIsolateMaxNodes = 800
+	DefaultIsolateMaxEdges = 1600
 )
 
-// DefaultVisibleProtocols are the "general" protocols shown to a freshly
-// connected client. Everything else starts hidden until the user opts in.
-// Mirrors the client-side default that used to live in app.js.
-var DefaultVisibleProtocols = map[string]bool{
-	"ARP": true, "ICMP": true, "TCP": true, "UDP": true,
-	"HTTP": true, "HTTPS": true, "DNS": true, "SSH": true,
-	"WireGuard": true, "OpenVPN": true,
-	// Note: the K8s · Cluster protocols (VXLAN/Geneve/K8s-API/etcd/Kubelet) are
-	// intentionally hidden by default — enable them in the filters when needed.
+// DefaultVisibleProtocols returns the set of "general" protocol names shown to
+// a freshly connected client. Everything else starts hidden until the user
+// opts in. Derived from the catalog's DefaultVisible flag (protocols.json).
+// Note: the K8s · Cluster protocols (VXLAN/Geneve/K8s-API/etcd/Kubelet) are
+// intentionally hidden by default — enable them in the filters when needed.
+func DefaultVisibleProtocols() map[string]bool {
+	visible := make(map[string]bool)
+	for _, p := range capture.GetAllProtocols() {
+		if p.DefaultVisible {
+			visible[p.Name] = true
+		}
+	}
+	return visible
 }
 
 // DefaultHiddenProtocols returns the set of protocol names a new client should
@@ -46,7 +83,7 @@ var DefaultVisibleProtocols = map[string]bool{
 func DefaultHiddenProtocols() map[string]bool {
 	hidden := make(map[string]bool)
 	for _, p := range capture.GetAllProtocols() {
-		if !DefaultVisibleProtocols[p.Name] {
+		if !p.DefaultVisible {
 			hidden[p.Name] = true
 		}
 	}
@@ -81,10 +118,19 @@ type ViewConfig struct {
 	MaxEdges   int             // 0 -> DefaultMaxEdges
 
 	// Phase 4 subnet aggregation: kicks in above AggregateThreshold hosts
-	// (0 -> DefaultAggregateThreshold); ExpandedSubnets lists the /24 CIDRs the
-	// user has opened back up into individual hosts.
+	// (0 -> DefaultAggregateThreshold); ExpandedSubnets lists the /24 or /16
+	// CIDRs the user has opened (budgeted expand — see ExpandBudget).
 	AggregateThreshold int
 	ExpandedSubnets    map[string]bool
+
+	// Phase 6: FullExpand lists CIDRs that bypass the expand budget (show every
+	// member). FocusCIDR isolates the view to one cluster. ZoomBand is
+	// "far"|"mid"|"near"|"" and drives automatic aggregation depth.
+	// ExpandBudget 0 -> DefaultExpandBudget.
+	FullExpand   map[string]bool
+	FocusCIDR    string
+	ZoomBand     string
+	ExpandBudget int
 
 	// Raw switches the client to raw-scale streaming (cosmos.gl renderer): the
 	// hub sends the full filtered topology as binary frames (BuildRawTopology)
@@ -116,9 +162,13 @@ type ViewNode struct {
 	Pinned      bool     `json:"pinned,omitempty"`    // user-pinned position (Phase D)
 	IsSubnet    bool     `json:"isSubnet,omitempty"`  // Phase 4: collapsed /24 supernode
 	HostCount   int      `json:"hostCount,omitempty"` // member hosts in a collapsed subnet
+	IsTail      bool     `json:"isTail,omitempty"`    // Phase 6: residual "+N more" after budgeted expand
 }
 
 // ViewEdge is a render-ready edge. Hidden edges are never emitted.
+// Protocol carries Name + Color (canonical palette from capture/protocols.go)
+// so every renderer paints the same link color (Slurm coral, SSH red, …).
+// Width is precomputed server-side so clients don't redo log math.
 type ViewEdge struct {
 	ID             string           `json:"id"`
 	From           string           `json:"from"`
@@ -130,6 +180,7 @@ type ViewEdge struct {
 	ReversePackets int              `json:"reversePackets"`
 	ForwardBytes   int64            `json:"forwardBytes"`
 	ReverseBytes   int64            `json:"reverseBytes"`
+	Width          float64          `json:"width"` // render stroke width (px at 1×)
 }
 
 // ViewSnapshot is the full styled view for a client. The hub turns this into a
@@ -142,6 +193,44 @@ type ViewSnapshot struct {
 	// when aggregation is inactive). Server-side only: the hub uses it to remap
 	// traffic flows into the aggregated view.
 	HostToSuper map[string]string `json:"-"`
+}
+
+// viewState carries per-client BuildView state across ticks: whether the view
+// is currently aggregated (hysteresis) and the previous tick's kept-node IDs
+// (top-N incumbent stickiness).
+type viewState struct {
+	aggregated bool
+	prevKept   map[string]bool
+}
+
+// viewStates is a side table keyed by the client's *LayoutEngine. BuildView
+// takes ViewConfig BY VALUE (the server hands it a copy per tick), so the
+// config itself can't carry state; the layout engine is the one per-client
+// graph object that arrives by pointer. The hub calls BuildView from a single
+// goroutine, so a viewState is only ever mutated by one goroutine at a time;
+// the mutex guards the table itself.
+var (
+	viewStatesMu sync.Mutex
+	viewStates   = make(map[*LayoutEngine]*viewState)
+)
+
+// viewStateFor returns the persistent view state for this client's layout
+// engine, or nil when le is nil (tests, one-shot replay builds — stateless).
+func viewStateFor(le *LayoutEngine) *viewState {
+	if le == nil {
+		return nil
+	}
+	viewStatesMu.Lock()
+	defer viewStatesMu.Unlock()
+	if len(viewStates) >= maxViewStates {
+		viewStates = make(map[*LayoutEngine]*viewState)
+	}
+	vs := viewStates[le]
+	if vs == nil {
+		vs = &viewState{}
+		viewStates[le] = vs
+	}
+	return vs
 }
 
 // BuildView runs the full server-side pipeline for one client view:
@@ -172,6 +261,43 @@ func BuildView(raw RawSnapshot, cfg ViewConfig, le *LayoutEngine, ov *OverrideSt
 	maxEdges := cfg.MaxEdges
 	if maxEdges <= 0 {
 		maxEdges = DefaultMaxEdges
+	}
+	// Solar (cosmos explorer) targets hundreds–~1000 individual hosts — a graph
+	// of planets, not two giant /24 boxes. Raise caps and defer aggregation so
+	// the map actually shows hosts (see Image: collapsed supernodes felt empty).
+	if cfg.LayoutMode == "solar" {
+		if maxNodes < 1000 {
+			maxNodes = 1000
+		}
+		if maxEdges < 2500 {
+			maxEdges = 2500
+		}
+	}
+	// Isolate mode: raise caps so a focused cluster can show more members.
+	if cfg.FocusCIDR != "" {
+		if maxNodes < DefaultIsolateMaxNodes {
+			maxNodes = DefaultIsolateMaxNodes
+		}
+		if maxEdges < DefaultIsolateMaxEdges {
+			maxEdges = DefaultIsolateMaxEdges
+		}
+	}
+	expandBudget := cfg.ExpandBudget
+	if expandBudget <= 0 {
+		expandBudget = DefaultExpandBudget
+	}
+	// Zoom band adjusts how aggressively we collapse (semantic zoom).
+	// User pin-open (ExpandedSubnets / FullExpand) always wins over auto-collapse.
+	switch cfg.ZoomBand {
+	case "far":
+		if expandBudget > 40 {
+			expandBudget = 40
+		}
+	case "near":
+		// Allow denser individual hosts when zoomed in.
+		if expandBudget < 200 {
+			expandBudget = 200
+		}
 	}
 	hidden := cfg.Hidden
 	filtering := len(hidden) > 0
@@ -212,30 +338,70 @@ func BuildView(raw RawSnapshot, cfg ViewConfig, le *LayoutEngine, ov *OverrideSt
 		kept = append(kept, n)
 	}
 
-	// Phase 4/5: hierarchical subnet aggregation. Above the threshold, hosts
-	// sharing a /24 collapse into one supernode per subnet; if the view is
-	// STILL over budget, /24 supernodes (and loose hosts) collapse further into
-	// /16 supernodes. Expansion peels one level: expanding a /16 reveals its
-	// /24 supernodes, expanding a /24 reveals hosts. Supernodes carry their
-	// members' summed counters and compete in top-N selection like any node.
+	// Per-client state for aggregation hysteresis + top-N stickiness (nil when
+	// no layout engine — one-shot builds stay stateless).
+	vs := viewStateFor(le)
+
+	// Phase 4/5/6: hierarchical subnet aggregation with budgeted expand.
+	// Above the threshold, hosts sharing a /24 collapse into supernodes; if
+	// still over budget, fold into /16s. Expansion peels one level. Phase 6
+	// budgeted expand: opening a dense CIDR reveals only the top ExpandBudget
+	// members; the rest become a residual "+N more" supernode (id = cidr+"+").
 	aggThreshold := cfg.AggregateThreshold
 	if aggThreshold <= 0 {
 		aggThreshold = DefaultAggregateThreshold
 	}
+	// Solar explorer: show individual hosts up to the node cap. Collapsing to a
+	// handful of /24 squares is the opposite of a fluid network graph.
+	if cfg.LayoutMode == "solar" && (cfg.AggregateThreshold <= 0 || cfg.AggregateThreshold == DefaultAggregateThreshold) {
+		aggThreshold = maxNodes + 1 // no collapse until past the top-N cap
+	}
+	switch cfg.ZoomBand {
+	case "far":
+		// Prefer heavy aggregation when zoomed out — but not in solar mode,
+		// where orbits need real hosts to feel like a system map.
+		if cfg.LayoutMode != "solar" && aggThreshold > 80 {
+			aggThreshold = 80
+		}
+	case "near":
+		// Stay expanded longer when zoomed in.
+		if aggThreshold < 600 {
+			aggThreshold = 600
+		}
+	}
 	var hostToSuper map[string]string // collapsed host/super ID -> visible supernode ID
 	superHosts := map[string]int{}    // supernode ID -> member host count
+	tailSupers := map[string]bool{}   // residual "+N more" supernode IDs
 
-	// collapseLevel folds kept-nodes into supernodes keyed by cidrOf (empty key
-	// = never collapse). Members already counted in superHosts contribute their
-	// own host counts. Mutates kept/hostToSuper/superHosts/visible.
+	// isExpanded reports whether the user has pin-opened a CIDR (budgeted or full).
+	isExpanded := func(cidr string) bool {
+		return cfg.ExpandedSubnets[cidr] || (cfg.FullExpand != nil && cfg.FullExpand[cidr])
+	}
+	isFullExpand := func(cidr string) bool {
+		return cfg.FullExpand != nil && cfg.FullExpand[cidr]
+	}
+
+	// memberHostCount returns how many leaf hosts a kept entry represents.
+	memberHostCount := func(n *Node) int {
+		if mh := superHosts[n.ID()]; mh > 0 {
+			return mh
+		}
+		return 1
+	}
+
+	// collapseLevel folds kept-nodes into supernodes keyed by cidrOf.
+	// Expanded CIDRs get a budgeted partial expand instead of full reveal.
+	// Mutates kept/hostToSuper/superHosts/visible/tailSupers.
 	collapseLevel := func(cidrOf func(*Node) string) {
 		groups := make(map[string][]int)
 		for i := range kept {
 			if isGroup(&kept[i]) {
 				continue // multicast/broadcast groups stay as-is
 			}
+			// Residual tails and other supers already in superHosts are only
+			// re-grouped when cidrOf returns a parent key (e.g. /24 -> /16).
 			cidr := cidrOf(&kept[i])
-			if cidr == "" || cfg.ExpandedSubnets[cidr] {
+			if cidr == "" {
 				continue
 			}
 			groups[cidr] = append(groups[cidr], i)
@@ -245,7 +411,43 @@ func BuildView(raw RawSnapshot, cfg ViewConfig, le *LayoutEngine, ov *OverrideSt
 		}
 		collapsed := make(map[int]bool)
 		var supers []Node
+
 		for cidr, idxs := range groups {
+			// Fully open: leave every member as its own node.
+			if isFullExpand(cidr) {
+				continue
+			}
+			// Budgeted expand: keep the busiest ExpandBudget members free;
+			// fold the quiet remainder into a residual tail supernode.
+			if isExpanded(cidr) {
+				if len(idxs) <= expandBudget {
+					continue
+				}
+				sort.Slice(idxs, func(a, b int) bool {
+					return effective(&kept[idxs[a]]) > effective(&kept[idxs[b]])
+				})
+				tailID := residualSuperID(cidr)
+				tail := Node{
+					IP:       tailID,
+					Hostname: cidr, // base CIDR for labels / expand-more
+					IPs:      []string{networkAddrOfCIDR(cidr)},
+				}
+				hc := 0
+				for _, i := range idxs[expandBudget:] {
+					collapsed[i] = true
+					memberID := kept[i].ID()
+					hostToSuper[memberID] = tailID
+					tail.PacketCount += kept[i].PacketCount
+					tail.ByteCount += kept[i].ByteCount
+					visible[tailID] += visible[memberID]
+					hc += memberHostCount(&kept[i])
+				}
+				superHosts[tailID] = hc
+				tailSupers[tailID] = true
+				supers = append(supers, tail)
+				continue
+			}
+			// Fully collapsed supernode.
 			if len(idxs) < minHostsToCollapse {
 				continue
 			}
@@ -254,7 +456,7 @@ func BuildView(raw RawSnapshot, cfg ViewConfig, le *LayoutEngine, ov *OverrideSt
 				Hostname: cidr,
 				// Network address as the node's IP so the subnet layout mode
 				// groups each supernode into its own island.
-				IPs: []string{cidr[:strings.IndexByte(cidr, '/')]},
+				IPs: []string{networkAddrOfCIDR(cidr)},
 			}
 			hc := 0
 			for _, i := range idxs {
@@ -265,16 +467,12 @@ func BuildView(raw RawSnapshot, cfg ViewConfig, le *LayoutEngine, ov *OverrideSt
 				super.ByteCount += kept[i].ByteCount
 				// Keep effective() correct when a protocol filter is active.
 				visible[cidr] += visible[memberID]
-				if mh := superHosts[memberID]; mh > 0 {
-					hc += mh // member is itself a supernode (e.g. /24 in /16)
-				} else {
-					hc++
-				}
+				hc += memberHostCount(&kept[i])
 			}
 			superHosts[cidr] = hc
 			supers = append(supers, super)
 		}
-		if len(supers) > 0 {
+		if len(supers) > 0 || len(collapsed) > 0 {
 			newKept := supers
 			for i := range kept {
 				if !collapsed[i] {
@@ -285,11 +483,23 @@ func BuildView(raw RawSnapshot, cfg ViewConfig, le *LayoutEngine, ov *OverrideSt
 		}
 	}
 
-	if len(kept) > aggThreshold {
+	// Always aggregate when over threshold; at "far" zoom force aggregation even
+	// for modest graphs so the overview stays legible.
+	forceAgg := cfg.ZoomBand == "far" && len(kept) > minHostsToCollapse
+	// Hysteresis: once aggregated, stay aggregated until the kept-host count
+	// drops well below the threshold, so a burst hovering near it doesn't flip
+	// the display strategy (hosts <-> supernodes) tick to tick.
+	reexpandFloor := aggThreshold * (aggregateReexpandDivisor - 1) / aggregateReexpandDivisor
+	aggActive := len(kept) > aggThreshold || forceAgg
+	if !aggActive && vs != nil && vs.aggregated && len(kept) > reexpandFloor {
+		aggActive = true
+	}
+	if aggActive {
 		// Level 1: hosts -> /24 supernodes.
 		collapseLevel(func(n *Node) string {
-			if superHosts[n.ID()] > 0 {
-				return "" // already a supernode
+			id := n.ID()
+			if superHosts[id] > 0 {
+				return "" // already a supernode (including residual tails)
 			}
 			s := primarySubnet24(*n)
 			if s == "" {
@@ -297,14 +507,23 @@ func BuildView(raw RawSnapshot, cfg ViewConfig, le *LayoutEngine, ov *OverrideSt
 			}
 			return s + ".0/24"
 		})
-		// Level 2: still over budget -> fold /24 supers + loose hosts into /16s.
-		if len(kept) > aggThreshold {
+		// Level 2: still over budget (or far zoom) -> fold /24 supers + loose
+		// hosts into /16s. Hosts/tails whose /24 is pin-expanded stay out so
+		// the peel-one-level UX is preserved.
+		needL2 := len(kept) > aggThreshold || cfg.ZoomBand == "far"
+		if needL2 {
 			collapseLevel(func(n *Node) string {
 				id := n.ID()
 				var s string
 				if superHosts[id] > 0 {
-					s = strings.TrimSuffix(id, ".0/24") // "a.b.c"
-					if s == id {
+					base := baseCIDR(id)
+					// Expanded /24 (or its residual tail) must stay visible —
+					// do not fold it back into a /16 while the user has it open.
+					if isExpanded(base) {
+						return ""
+					}
+					s = strings.TrimSuffix(base, ".0/24") // "a.b.c" from "a.b.c.0/24"
+					if s == base {
 						return "" // already a /16 (or other) supernode
 					}
 				} else {
@@ -313,11 +532,14 @@ func BuildView(raw RawSnapshot, cfg ViewConfig, le *LayoutEngine, ov *OverrideSt
 						return ""
 					}
 					// A host whose /24 the user explicitly expanded stays out.
-					if cfg.ExpandedSubnets[s+".0/24"] {
+					if isExpanded(s + ".0/24") {
 						return ""
 					}
 				}
 				dot := strings.LastIndexByte(s, '.')
+				if dot < 0 {
+					return ""
+				}
 				return s[:dot] + ".0.0/16"
 			})
 		}
@@ -341,16 +563,96 @@ func BuildView(raw RawSnapshot, cfg ViewConfig, le *LayoutEngine, ov *OverrideSt
 		return id
 	}
 
-	// Top-N by effective traffic.
+	// Isolate mode: keep only nodes that belong to the focused cluster.
+	if focus := cfg.FocusCIDR; focus != "" {
+		focus = baseCIDR(focus)
+		filtered := kept[:0]
+		for i := range kept {
+			if nodeBelongsToCIDR(&kept[i], focus, isSuper) {
+				filtered = append(filtered, kept[i])
+			}
+		}
+		kept = filtered
+	}
+
+	// Top-N by effective traffic. Protect focused/expanded-cluster members so
+	// a busy unrelated hub can't push the drill-down set off the screen.
+	var prevKept map[string]bool
+	if vs != nil {
+		prevKept = vs.prevKept
+	}
 	sort.Slice(kept, func(a, b int) bool {
-		return effective(&kept[a]) > effective(&kept[b])
+		ka, kb := effective(&kept[a]), effective(&kept[b])
+		// Incumbent stickiness: nodes kept last tick get a small bonus on the
+		// sort key only, so boundary nodes don't flap in/out every tick.
+		if prevKept != nil {
+			if prevKept[kept[a].ID()] {
+				ka = int(float64(ka) * incumbentBonus)
+			}
+			if prevKept[kept[b].ID()] {
+				kb = int(float64(kb) * incumbentBonus)
+			}
+		}
+		if ka != kb {
+			return ka > kb
+		}
+		// ID tiebreak (mirrors the edge sort below): equal-traffic nodes never
+		// reshuffle between ticks.
+		return kept[a].ID() < kept[b].ID()
 	})
 	if len(kept) > maxNodes {
-		kept = kept[:maxNodes]
+		// Prefer keeping: focus members, residual tails, expanded-CIDR members.
+		protected := make(map[string]bool)
+		if cfg.FocusCIDR != "" {
+			f := baseCIDR(cfg.FocusCIDR)
+			for i := range kept {
+				if nodeBelongsToCIDR(&kept[i], f, isSuper) {
+					protected[kept[i].ID()] = true
+				}
+			}
+		}
+		for cidr := range cfg.ExpandedSubnets {
+			for i := range kept {
+				if nodeBelongsToCIDR(&kept[i], baseCIDR(cidr), isSuper) {
+					protected[kept[i].ID()] = true
+				}
+			}
+		}
+		if len(protected) == 0 || len(protected) >= maxNodes {
+			kept = kept[:maxNodes]
+		} else {
+			// Take all protected first, then fill with busiest unprotected.
+			out := make([]Node, 0, maxNodes)
+			seen := make(map[string]bool, maxNodes)
+			for i := range kept {
+				id := kept[i].ID()
+				if protected[id] && len(out) < maxNodes {
+					out = append(out, kept[i])
+					seen[id] = true
+				}
+			}
+			for i := range kept {
+				if len(out) >= maxNodes {
+					break
+				}
+				id := kept[i].ID()
+				if !seen[id] {
+					out = append(out, kept[i])
+					seen[id] = true
+				}
+			}
+			kept = out
+		}
 	}
 	keptIDs := make(map[string]bool, len(kept))
 	for i := range kept {
 		keptIDs[kept[i].ID()] = true
+	}
+	// Persist per-view state for the next tick: the final kept set drives
+	// incumbent stickiness, the aggregation flag drives the hysteresis band.
+	if vs != nil {
+		vs.prevKept = keptIDs
+		vs.aggregated = aggActive
 	}
 
 	// Thresholds from real (non-group, non-subnet) kept nodes' effective counts.
@@ -502,15 +804,20 @@ func BuildView(raw RawSnapshot, cfg ViewConfig, le *LayoutEngine, ov *OverrideSt
 		grp := isGroup(n)
 		vn.IsGroup = grp
 		styleNode(&vn, count, grp, lowThreshold, mediumThreshold)
-		// Subnet supernodes get their own look: box shape, size driven by how
-		// many hosts they hold (not raw traffic, which would dwarf everything),
-		// neutral tier — the client colors them distinctly via isSubnet.
+		// Subnet supernodes: large circles (not boxes — boxes looked like a UI
+		// glitch on the map). Size from host count; residual tails run warmer.
 		if hc := superHosts[vn.ID]; hc > 0 {
 			vn.IsSubnet = true
 			vn.HostCount = hc
-			vn.Shape = "box"
+			vn.Shape = "dot"
 			vn.Value = math.Sqrt(float64(hc)) * 6
-			vn.ColorTier = 0
+			if tailSupers[vn.ID] {
+				vn.IsTail = true
+				vn.Label = residualLabel(vn.ID, hc)
+				vn.ColorTier = 2 // warmer than collapsed supernodes
+			} else {
+				vn.ColorTier = 0
+			}
 		}
 		if le != nil {
 			p := le.Position(cfg.LayoutMode, vn.ID)
@@ -544,17 +851,34 @@ func BuildView(raw RawSnapshot, cfg ViewConfig, le *LayoutEngine, ov *OverrideSt
 	viewEdges := make([]ViewEdge, 0, len(candEdges))
 	for i := range candEdges {
 		e := &candEdges[i]
+		// log-scaled width matches the WebGL/vis path so cosmos and map agree.
+		w := math.Log1p(float64(e.PacketCount))*0.5 + 1
+		if w < 1 {
+			w = 1
+		}
+		if w > 8 {
+			w = 8
+		}
+		// Ensure protocol color is always populated (defensive).
+		proto := e.Protocol
+		if proto.Color == "" {
+			proto.Color = "#95a5a6"
+		}
+		if proto.Name == "" {
+			proto.Name = "Other"
+		}
 		viewEdges = append(viewEdges, ViewEdge{
 			ID:             e.ID,
 			From:           e.From,
 			To:             e.To,
-			Protocol:       e.Protocol,
+			Protocol:       proto,
 			PacketCount:    e.PacketCount,
 			ByteCount:      e.ByteCount,
 			ForwardPackets: e.ForwardPackets,
 			ReversePackets: e.ReversePackets,
 			ForwardBytes:   e.ForwardBytes,
 			ReverseBytes:   e.ReverseBytes,
+			Width:          w,
 		})
 	}
 
@@ -597,6 +921,92 @@ func styleNode(vn *ViewNode, count int, isGroup bool, low, medium float64) {
 	}
 	vn.Shape = "dot"
 	vn.ColorTier = colorTier(count, low, medium)
+}
+
+// residualSuperID is the synthetic id for a budgeted-expand tail supernode.
+// The trailing '+' never appears in real IPv4 host or CIDR ids.
+func residualSuperID(cidr string) string {
+	return cidr + "+"
+}
+
+// baseCIDR strips a residual '+' suffix so focus/expand keys compare cleanly.
+func baseCIDR(id string) string {
+	return strings.TrimSuffix(id, "+")
+}
+
+// networkAddrOfCIDR returns the network address portion before the slash
+// (e.g. "10.0.0.0/24" -> "10.0.0.0"). Falls back to the whole string.
+func networkAddrOfCIDR(cidr string) string {
+	if i := strings.IndexByte(cidr, '/'); i >= 0 {
+		return cidr[:i]
+	}
+	return cidr
+}
+
+// residualLabel is the human-readable name for a "+N more" tail supernode.
+func residualLabel(tailID string, hostCount int) string {
+	return "+" + itoa(hostCount) + " more in " + baseCIDR(tailID)
+}
+
+// itoa avoids strconv for a tiny helper used only in residual labels.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
+// nodeBelongsToCIDR reports whether n is the given CIDR supernode, its residual
+// tail, a nested /24 under a focused /16, or a host inside that CIDR.
+func nodeBelongsToCIDR(n *Node, cidr string, isSuper func(string) bool) bool {
+	if cidr == "" {
+		return true
+	}
+	cidr = baseCIDR(cidr)
+	id := n.ID()
+	if id == cidr || id == residualSuperID(cidr) {
+		return true
+	}
+	// Nested supernode under a /16 focus: "a.b.c.0/24" belongs to "a.b.0.0/16".
+	if isSuper != nil && isSuper(id) {
+		base := baseCIDR(id)
+		if strings.HasSuffix(cidr, "/16") && strings.HasSuffix(base, "/24") {
+			return subnet16From24(base) == cidr
+		}
+		return false
+	}
+	if strings.HasSuffix(cidr, "/24") {
+		s := primarySubnet24(*n)
+		return s != "" && s+".0/24" == cidr
+	}
+	if strings.HasSuffix(cidr, "/16") {
+		s := primarySubnet24(*n)
+		if s == "" {
+			return false
+		}
+		return subnet16From24(s+".0/24") == cidr
+	}
+	return false
+}
+
+// subnet16From24 maps "a.b.c.0/24" -> "a.b.0.0/16".
+func subnet16From24(c24 string) string {
+	base := strings.TrimSuffix(c24, ".0/24")
+	if base == c24 {
+		return ""
+	}
+	dot := strings.LastIndexByte(base, '.')
+	if dot < 0 {
+		return ""
+	}
+	return base[:dot] + ".0.0/16"
 }
 
 // nodeValue is the traffic-based size driver, kept in one place so the layout's

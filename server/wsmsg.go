@@ -23,13 +23,16 @@ type SetLayoutMsg struct {
 	Mode string `json:"mode"`
 }
 
-// SetAggregationMsg syncs the client's Phase 4 subnet-aggregation state: the
-// activation threshold (0 = server default) and the full set of /24 CIDRs the
-// user has expanded back into individual hosts. Sent on connect and on every
-// expand/collapse so reconnects restore the same view.
+// SetAggregationMsg syncs the client's Phase 4/6 subnet-aggregation state: the
+// activation threshold (0 = server default), pin-opened CIDRs (budgeted expand),
+// fully-expanded CIDRs (no residual tail), optional isolate FocusCIDR, and the
+// camera ZoomBand for semantic zoom LOD. Sent on connect and on every change.
 type SetAggregationMsg struct {
-	Threshold int      `json:"threshold"`
-	Expanded  []string `json:"expanded"`
+	Threshold  int      `json:"threshold"`
+	Expanded   []string `json:"expanded"`
+	FullExpand []string `json:"fullExpand,omitempty"`
+	Focus      string   `json:"focus,omitempty"`
+	ZoomBand   string   `json:"zoomBand,omitempty"`
 }
 
 // SetTimelineMsg enters/moves/exits timeline mode: the client's view is built

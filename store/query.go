@@ -3,6 +3,7 @@ package store
 import (
 	"time"
 
+	"etherchimp/capture"
 	"etherchimp/graph"
 )
 
@@ -329,8 +330,8 @@ func (s *Store) WindowAggregates(captureID, from, to int64) ([]StoredNode, []Sto
 		e.ReverseBytes += revB
 		// Dominant protocol, mirroring the live edge rule: a specific protocol
 		// beats generic TCP/UDP; within the same class the busiest wins.
-		curGeneric := e.Protocol == "TCP" || e.Protocol == "UDP"
-		newGeneric := proto == "TCP" || proto == "UDP"
+		curGeneric := capture.IsGenericName(e.Protocol)
+		newGeneric := capture.IsGenericName(proto)
 		if (curGeneric && !newGeneric) ||
 			(curGeneric == newGeneric && packets > protoPackets[id]) {
 			e.Protocol = proto

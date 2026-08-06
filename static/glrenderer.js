@@ -30,6 +30,8 @@
 
     // Shared with cosmosrenderer.js — see static/colorutil.js.
     const parseColor = window.parseRendererColor;
+    const themeColor = window.themeProtocolColor || parseColor;
+    const isLightTheme = () => (window.isLightTheme ? window.isLightTheme() : false);
 
     function easeInOutQuad(t) { return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; }
 
@@ -197,11 +199,16 @@
     const EDGE_FLOATS = 10;  // from2 to2 width1 color4 bend1
     const LABEL_FLOATS = 14; // anchor2 offset2 size2 uv4 color4
     const MAX_PARTICLES = 220;
-    const EDGE_SEGMENTS = 24;  // bezier ribbon tessellation
+    const EDGE_SEGMENTS = 24;  // bezier ribbon tessellation (near zoom)
+    const EDGE_SEGMENTS_FAR = 2; // straight ribbon when zoomed out (LOD)
     const EDGE_CURVE = 0.12;   // control-point offset as a fraction of length
+    // Below this camera scale, draw straight thin edges (skip bezier cost).
+    const EDGE_CURVE_MIN_SCALE = 0.55;
     // Don't spawn a new particle on an edge whose newest particle is still in
     // its first stretch — busy edges show a spaced stream, not a rope of dots.
     const PARTICLE_EDGE_GAP = 0.35;
+    // Spatial hash cell size in graph units for hit-testing.
+    const HIT_GRID_CELL = 80;
 
     // Quadratic-bezier point at t for the edge a->b, matching EDGE_VS. bend
     // (+1/-1) picks the curve side; it must be derived the same way everywhere:
@@ -298,6 +305,14 @@
             this._overlayDirty = true;
             this._overlayCamSig = '';
 
+            // Phase 6 dirty flags: skip full instance rebuild on camera-only frames.
+            this._nodesDirty = true;
+            this._edgesDirty = true;
+            this._hitDirty = true;
+            this._cachedNodeCount = 0;
+            this._hitGrid = null; // Map cellKey -> [id,...]
+            this._lastFrameMs = 0;
+
             // Sync from the DataSets (initial load + live events).
             this._syncAll();
             this._nodeSub = (ev, props) => this._onNodesEvent(ev, props);
@@ -312,6 +327,32 @@
                 this._ro.observe(container);
             }
             this.redraw();
+        }
+
+        // Mark topology/style dirty so the next _draw rebuilds GPU instance buffers.
+        // Position changes (easing) must dirty both nodes and edges — edge
+        // instance data embeds endpoint coordinates.
+        markSceneDirty(kind) {
+            if (kind === 'nodes' || kind === 'all' || kind == null) {
+                this._nodesDirty = true;
+                this._edgesDirty = true; // endpoints move with nodes
+                this._hitDirty = true;
+            }
+            if (kind === 'edges' || kind === 'all' || kind == null) {
+                this._edgesDirty = true;
+            }
+            this.redraw();
+        }
+
+        // Adaptive particle cap: fewer dots when the graph is large or the last
+        // frame was expensive, so pan/zoom stays fluid inside dense clusters.
+        _particleCap() {
+            const n = this._cachedNodeCount || Object.keys(this.body.nodes).length;
+            let cap = MAX_PARTICLES;
+            if (n > 400) cap = 80;
+            else if (n > 200) cap = 140;
+            if (this._lastFrameMs > 12) cap = Math.min(cap, 60);
+            return cap;
         }
 
         // ----- geometry / GL state
@@ -484,6 +525,8 @@
                 }
             }
             this._recomputeSizes();
+            this._nodesDirty = true;
+            this._hitDirty = true;
             // First data arrival: fit now for an immediate sensible view, then
             // keep watching until the server layout settles and fit once more —
             // the first positions are pre-convergence seeds, so a single early
@@ -541,6 +584,7 @@
                     if (item) this._syncEdge(item);
                 }
             }
+            this._edgesDirty = true;
             this.redraw();
         }
 
@@ -769,8 +813,9 @@
                     speed: f.speed
                 });
             }
-            if (this.particles.length > MAX_PARTICLES) {
-                this.particles.splice(0, this.particles.length - MAX_PARTICLES);
+            const cap = this._particleCap();
+            if (this.particles.length > cap) {
+                this.particles.splice(0, this.particles.length - cap);
             }
             this.redraw();
         }
@@ -911,15 +956,46 @@
             }
         }
 
-        _hitNode(p) {
-            const g = this.DOMtoCanvas(p);
-            let best = null, bestD = Infinity;
+        _rebuildHitGrid() {
+            const grid = new Map();
+            const cell = HIT_GRID_CELL;
+            let count = 0;
             for (const id in this.body.nodes) {
                 const n = this.body.nodes[id];
-                const r = (n.options.size || 20) + 4 / this.camera.scale;
-                const dx = g.x - n.x, dy = g.y - n.y;
-                const d = dx * dx + dy * dy;
-                if (d < r * r && d < bestD) { bestD = d; best = id; }
+                const cx = Math.floor(n.x / cell);
+                const cy = Math.floor(n.y / cell);
+                const key = cx + ',' + cy;
+                let bucket = grid.get(key);
+                if (!bucket) { bucket = []; grid.set(key, bucket); }
+                bucket.push(id);
+                count++;
+            }
+            this._hitGrid = grid;
+            this._cachedNodeCount = count;
+            this._hitDirty = false;
+        }
+
+        _hitNode(p) {
+            const g = this.DOMtoCanvas(p);
+            if (this._hitDirty || !this._hitGrid) this._rebuildHitGrid();
+            const cell = HIT_GRID_CELL;
+            const cx = Math.floor(g.x / cell);
+            const cy = Math.floor(g.y / cell);
+            let best = null, bestD = Infinity;
+            // Search the home cell and its 8 neighbours (covers radius ~cell).
+            for (let dx = -1; dx <= 1; dx++) {
+                for (let dy = -1; dy <= 1; dy++) {
+                    const bucket = this._hitGrid.get((cx + dx) + ',' + (cy + dy));
+                    if (!bucket) continue;
+                    for (const id of bucket) {
+                        const n = this.body.nodes[id];
+                        if (!n) continue;
+                        const r = (n.options.size || 20) + 4 / this.camera.scale;
+                        const ox = g.x - n.x, oy = g.y - n.y;
+                        const d = ox * ox + oy * oy;
+                        if (d < r * r && d < bestD) { bestD = d; best = id; }
+                    }
+                }
             }
             return best;
         }
@@ -1000,108 +1076,136 @@
 
         _draw() {
             if (this.destroyed) return;
+            const t0 = performance.now();
             const animating = this._stepAnim();
             const particlesAlive = this._stepParticles();
             const gl = this.gl;
             const cam = this.camera;
+            // Far zoom: collapse bezier to straight ribbons (same geometry, curve=0).
+            const useCurve = cam.scale >= EDGE_CURVE_MIN_SCALE;
+            const curveAmt = useCurve ? EDGE_CURVE : 0;
+            // Edge width embeds cam.scale, so zoom must rebuild edge instances.
+            const scaleKey = Math.round(cam.scale * 100);
+            if (scaleKey !== this._lastEdgeScaleKey) {
+                this._lastEdgeScaleKey = scaleKey;
+                this._edgesDirty = true;
+            }
 
             gl.viewport(0, 0, this.glCanvas.width, this.glCanvas.height);
             gl.clearColor(0, 0, 0, 0);
             gl.clear(gl.COLOR_BUFFER_BIT);
 
-            // --- edges
+            // --- edges (rebuild only when topology/style/zoom changes)
             const edgeIds = Object.keys(this.body.edges);
             if (edgeIds.length) {
-                if (this.edgeArr.length < edgeIds.length * EDGE_FLOATS) {
-                    this.edgeArr = new Float32Array(Math.ceil(edgeIds.length * 1.3) * EDGE_FLOATS);
+                if (this._edgesDirty || this._edgeDrawCount == null) {
+                    if (this.edgeArr.length < edgeIds.length * EDGE_FLOATS) {
+                        this.edgeArr = new Float32Array(Math.ceil(edgeIds.length * 1.3) * EDGE_FLOATS);
+                    }
+                    const arr = this.edgeArr;
+                    let n = 0;
+                    for (const id of edgeIds) {
+                        const e = this.body.edges[id];
+                        const a = this.body.nodes[e.fromId], b = this.body.nodes[e.toId];
+                        if (!a || !b) continue;
+                        const col = themeColor(e.options.color.color, isLightTheme());
+                        const alpha = (e.options.color.opacity == null ? 1 : e.options.color.opacity) * 0.78;
+                        let o = n * EDGE_FLOATS;
+                        arr[o++] = a.x; arr[o++] = a.y; arr[o++] = b.x; arr[o++] = b.y;
+                        // Width in screen px: at far zoom keep a 1px floor.
+                        arr[o++] = Math.max(1, (e.options.width || 1) * (useCurve ? cam.scale : Math.max(cam.scale, 0.4)));
+                        arr[o++] = col[0]; arr[o++] = col[1]; arr[o++] = col[2]; arr[o++] = col[3] * alpha;
+                        arr[o++] = edgeBend(e.fromId, e.toId);
+                        n++;
+                    }
+                    this._edgeDrawCount = n;
+                    gl.bindVertexArray(this.edgeVAO);
+                    gl.bindBuffer(gl.ARRAY_BUFFER, this.edgeInstBuf);
+                    gl.bufferData(gl.ARRAY_BUFFER, arr.subarray(0, n * EDGE_FLOATS), gl.DYNAMIC_DRAW);
+                    this._edgesDirty = false;
                 }
-                const arr = this.edgeArr;
-                let n = 0;
-                for (const id of edgeIds) {
-                    const e = this.body.edges[id];
-                    const a = this.body.nodes[e.fromId], b = this.body.nodes[e.toId];
-                    if (!a || !b) continue;
-                    const col = parseColor(e.options.color.color);
-                    const alpha = (e.options.color.opacity == null ? 1 : e.options.color.opacity) * 0.7;
-                    let o = n * EDGE_FLOATS;
-                    arr[o++] = a.x; arr[o++] = a.y; arr[o++] = b.x; arr[o++] = b.y;
-                    arr[o++] = Math.max(1, (e.options.width || 1) * cam.scale);
-                    arr[o++] = col[0]; arr[o++] = col[1]; arr[o++] = col[2]; arr[o++] = col[3] * alpha;
-                    arr[o++] = edgeBend(e.fromId, e.toId);
-                    n++;
+                if (this._edgeDrawCount > 0) {
+                    gl.useProgram(this.edgeProg);
+                    this._applyUniforms(this.edgeU);
+                    gl.uniform1f(this.edgeU.curve, curveAmt);
+                    gl.bindVertexArray(this.edgeVAO);
+                    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, (EDGE_SEGMENTS + 1) * 2, this._edgeDrawCount);
                 }
-                gl.useProgram(this.edgeProg);
-                this._applyUniforms(this.edgeU);
-                gl.uniform1f(this.edgeU.curve, EDGE_CURVE);
-                gl.bindVertexArray(this.edgeVAO);
-                gl.bindBuffer(gl.ARRAY_BUFFER, this.edgeInstBuf);
-                gl.bufferData(gl.ARRAY_BUFFER, arr.subarray(0, n * EDGE_FLOATS), gl.DYNAMIC_DRAW);
-                gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, (EDGE_SEGMENTS + 1) * 2, n);
             }
 
-            // --- nodes + flow particles (same SDF-circle program; particles are
-            //     appended after nodes so they draw on top)
+            // --- nodes + flow particles (rebuild when dirty or particles move)
             const nodeIds = Object.keys(this.body.nodes);
+            this._cachedNodeCount = nodeIds.length;
+            const needNodeRebuild = this._nodesDirty || particlesAlive || this.particles.length > 0;
             const maxInst = nodeIds.length + this.particles.length;
             if (maxInst > 0) {
-                if (this.nodeArr.length < maxInst * NODE_FLOATS) {
-                    this.nodeArr = new Float32Array(Math.ceil(maxInst * 1.3) * NODE_FLOATS);
-                }
-                const arr = this.nodeArr;
-                let n = 0;
-                for (const id of nodeIds) {
-                    const bn = this.body.nodes[id];
-                    const o = bn.options;
-                    const selected = id === this.selectedNode;
-                    const colObj = o.color || {};
-                    const fillStr = selected && colObj.highlight ? colObj.highlight.background : colObj.background;
-                    const borderStr = selected && colObj.highlight ? colObj.highlight.border : colObj.border;
-                    const fill = parseColor(fillStr, [0.6, 0.6, 0.6, 1]);
-                    const border = parseColor(borderStr, [0.3, 0.3, 0.3, 1]);
-                    const op = o.opacity == null ? 1 : o.opacity;
-                    let halfW, halfH, shape;
-                    if (o.isGroup) {
-                        halfW = Math.max(24, ((o.label || '').length * 7 + 16) / 2);
-                        halfH = 13;
-                        shape = 1;
-                    } else {
-                        halfW = halfH = o.size || 20;
-                        shape = 0;
+                if (needNodeRebuild || this._nodeDrawCount == null) {
+                    if (this.nodeArr.length < maxInst * NODE_FLOATS) {
+                        this.nodeArr = new Float32Array(Math.ceil(maxInst * 1.3) * NODE_FLOATS);
                     }
-                    let k = n * NODE_FLOATS;
-                    arr[k++] = bn.x; arr[k++] = bn.y;
-                    arr[k++] = halfW; arr[k++] = halfH;
-                    arr[k++] = fill[0]; arr[k++] = fill[1]; arr[k++] = fill[2]; arr[k++] = fill[3] * op;
-                    arr[k++] = border[0]; arr[k++] = border[1]; arr[k++] = border[2]; arr[k++] = border[3] * op;
-                    arr[k++] = shape;
-                    n++;
+                    const arr = this.nodeArr;
+                    let n = 0;
+                    for (const id of nodeIds) {
+                        const bn = this.body.nodes[id];
+                        const o = bn.options;
+                        const selected = id === this.selectedNode;
+                        const colObj = o.color || {};
+                        const fillStr = selected && colObj.highlight ? colObj.highlight.background : colObj.background;
+                        const borderStr = selected && colObj.highlight ? colObj.highlight.border : colObj.border;
+                        const fill = parseColor(fillStr, [0.6, 0.6, 0.6, 1]);
+                        const border = parseColor(borderStr, [0.3, 0.3, 0.3, 1]);
+                        const op = o.opacity == null ? 1 : o.opacity;
+                        let halfW, halfH, shape;
+                        if (o.isGroup) {
+                            halfW = Math.max(24, ((o.label || '').length * 7 + 16) / 2);
+                            halfH = 13;
+                            shape = 1;
+                        } else {
+                            halfW = halfH = o.size || 20;
+                            shape = 0;
+                        }
+                        let k = n * NODE_FLOATS;
+                        arr[k++] = bn.x; arr[k++] = bn.y;
+                        arr[k++] = halfW; arr[k++] = halfH;
+                        arr[k++] = fill[0]; arr[k++] = fill[1]; arr[k++] = fill[2]; arr[k++] = fill[3] * op;
+                        arr[k++] = border[0]; arr[k++] = border[1]; arr[k++] = border[2]; arr[k++] = border[3] * op;
+                        arr[k++] = shape;
+                        n++;
+                    }
+                    for (const p of this.particles) {
+                        const a = this.body.nodes[p.fromId], b = this.body.nodes[p.toId];
+                        if (!a || !b) continue;
+                        const alpha = 0.9 * (1 - p.progress * 0.4);
+                        const c = p.color;
+                        // Ride the same curve the edge ribbon draws (straight when LOD far).
+                        const bend = useCurve ? edgeBend(p.fromId, p.toId) : 0;
+                        const pos = edgeCurvePoint(a, b, p.progress, bend);
+                        let k = n * NODE_FLOATS;
+                        arr[k++] = pos.x;
+                        arr[k++] = pos.y;
+                        arr[k++] = 3.5; arr[k++] = 3.5;
+                        arr[k++] = c[0]; arr[k++] = c[1]; arr[k++] = c[2]; arr[k++] = c[3] * alpha;
+                        arr[k++] = c[0]; arr[k++] = c[1]; arr[k++] = c[2]; arr[k++] = c[3] * alpha;
+                        arr[k++] = 0;
+                        n++;
+                    }
+                    this._nodeDrawCount = n;
+                    gl.bindVertexArray(this.nodeVAO);
+                    gl.bindBuffer(gl.ARRAY_BUFFER, this.nodeInstBuf);
+                    gl.bufferData(gl.ARRAY_BUFFER, arr.subarray(0, n * NODE_FLOATS), gl.DYNAMIC_DRAW);
+                    this._nodesDirty = false;
                 }
-                for (const p of this.particles) {
-                    const a = this.body.nodes[p.fromId], b = this.body.nodes[p.toId];
-                    if (!a || !b) continue;
-                    const alpha = 0.9 * (1 - p.progress * 0.4);
-                    const c = p.color;
-                    // Ride the same bezier the edge ribbon draws.
-                    const pos = edgeCurvePoint(a, b, p.progress, edgeBend(p.fromId, p.toId));
-                    let k = n * NODE_FLOATS;
-                    arr[k++] = pos.x;
-                    arr[k++] = pos.y;
-                    arr[k++] = 3.5; arr[k++] = 3.5;
-                    arr[k++] = c[0]; arr[k++] = c[1]; arr[k++] = c[2]; arr[k++] = c[3] * alpha;
-                    arr[k++] = c[0]; arr[k++] = c[1]; arr[k++] = c[2]; arr[k++] = c[3] * alpha;
-                    arr[k++] = 0;
-                    n++;
+                if (this._nodeDrawCount > 0) {
+                    gl.useProgram(this.nodeProg);
+                    this._applyUniforms(this.nodeU);
+                    gl.bindVertexArray(this.nodeVAO);
+                    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this._nodeDrawCount);
                 }
-                gl.useProgram(this.nodeProg);
-                this._applyUniforms(this.nodeU);
-                gl.bindVertexArray(this.nodeVAO);
-                gl.bindBuffer(gl.ARRAY_BUFFER, this.nodeInstBuf);
-                gl.bufferData(gl.ARRAY_BUFFER, arr.subarray(0, n * NODE_FLOATS), gl.DYNAMIC_DRAW);
-                gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
             }
 
             this._drawLabels();
             this._drawOverlay();
+            this._lastFrameMs = performance.now() - t0;
             if (animating || particlesAlive) this.redraw();
         }
 

@@ -30,8 +30,10 @@ type RawTopology struct {
 const DefaultRawMaxNodes = 150000
 
 // BuildRawTopology filters the snapshot by hidden protocols and flattens it to
-// indexed arrays. Nodes with no visible edge are dropped (same rule as the
-// styled view pipeline).
+// indexed arrays. When no protocol filter is active every live node is emitted
+// so a host persists on its own lifetime (node decay) instead of vanishing the
+// moment its last edge decays — the "grow and decay" behavior. With a filter
+// active it matches the styled view and drops nodes left isolated by the filter.
 func BuildRawTopology(raw RawSnapshot, hidden map[string]bool, maxNodes int) RawTopology {
 	if maxNodes <= 0 {
 		maxNodes = DefaultRawMaxNodes
@@ -58,6 +60,18 @@ func BuildRawTopology(raw RawSnapshot, hidden map[string]bool, maxNodes int) Raw
 		packetsByNode[e.From] += e.PacketCount
 		if e.To != e.From {
 			packetsByNode[e.To] += e.PacketCount
+		}
+	}
+
+	// Without a protocol filter, seed every live node as a candidate so it is
+	// emitted even with no visible edge — persistence is tied to node lifetime,
+	// not edge lifetime. Uses the node's own packet count for tier/cap ranking.
+	if len(hidden) == 0 {
+		for i := range raw.Nodes {
+			id := raw.Nodes[i].IP
+			if _, ok := packetsByNode[id]; !ok {
+				packetsByNode[id] = raw.Nodes[i].PacketCount
+			}
 		}
 	}
 
@@ -125,6 +139,16 @@ func BuildRawTopology(raw RawSnapshot, hidden map[string]bool, maxNodes int) Raw
 		t.EdgeA = append(t.EdgeA, addNode(e.From))
 		t.EdgeB = append(t.EdgeB, addNode(e.To))
 		t.EdgeProto = append(t.EdgeProto, pi)
+	}
+
+	// Emit any node that survived the cap but wasn't referenced by a visible
+	// edge (standalone nodes). addNode is idempotent, so edge endpoints already
+	// emitted are skipped. Iterating raw.Nodes keeps the order deterministic.
+	for i := range raw.Nodes {
+		id := raw.Nodes[i].IP
+		if _, keep := packetsByNode[id]; keep {
+			addNode(id)
+		}
 	}
 	return t
 }

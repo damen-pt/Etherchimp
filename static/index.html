@@ -225,6 +225,17 @@
                                         <span>Clustered Subnet</span>
                                     </button>
                                 </div>
+                                <div class="theme-toggle" style="margin-top:8px;border-top:1px solid rgba(127,140,141,0.25);padding-top:8px;">
+                                    <button class="theme-button" id="mapModeBtn" title="WebGL ops map — force layout, particles, aggregation">
+                                        <span>Map (WebGL)</span>
+                                    </button>
+                                    <button class="theme-button" id="exploreModeBtn" title="Solar-system explorer — stable planets, names/IPs, click for packets">
+                                        <span>Explore (Solar)</span>
+                                    </button>
+                                </div>
+                                <button class="theme-button" data-cluster="solar" style="margin-top:4px;width:100%;" title="Server solar-system layout (works with either renderer)">
+                                    <span>Solar System layout</span>
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -390,9 +401,10 @@
                             type="text"
                             id="searchInput"
                             class="search-input"
-                            placeholder="Type [/] to search"
+                            placeholder="Type '/' to search"
                             autocomplete="off"
                         >
+                        <span class="search-ghost" id="searchGhost" aria-hidden="true"></span>
                         <button class="search-clear" id="searchClear" style="display: none;">&times;</button>
                     </div>
                     <div class="search-results" id="searchResults"></div>

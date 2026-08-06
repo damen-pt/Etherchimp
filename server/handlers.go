@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"etherchimp/capture"
 	"etherchimp/graph"
 	"etherchimp/replay"
 	"etherchimp/store"
@@ -74,9 +75,48 @@ func (m *Manager) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if limit > 100 {
 		limit = 100
 	}
-	results := m.graphMgr.SearchNodes(q, limit)
+	// Try the Wireshark-subset display filter first; if the query isn't a
+	// structured filter (e.g. a bare "192"), fall back to substring search so
+	// existing behavior is preserved.
+	results, ok := m.graphMgr.SearchFilter(q, limit)
+	if !ok {
+		results = m.graphMgr.SearchNodes(q, limit)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
+}
+
+// handleRecentPacket returns the single most-recent buffered packet (with
+// payload) for a node or for a payload-text match, so clicking a search result
+// opens the packet inspector on the latest relevant packet rather than only the
+// details sidebar. GET /api/packet/recent?node=<id> or ?contains=<text>.
+//
+// Note: only the in-memory ring is searched. Matches older than the buffer
+// window (e.g. text early in a large replay) are not found — full historic
+// payload search needs persisted payloads or pcap offsets, which aren't
+// currently recorded.
+func (m *Manager) handleRecentPacket(w http.ResponseWriter, r *http.Request) {
+	node := r.URL.Query().Get("node")
+	contains := r.URL.Query().Get("contains")
+	var (
+		pkt graph.PacketData
+		ok  bool
+	)
+	switch {
+	case contains != "":
+		pkt, ok = m.graphMgr.MostRecentPacketContaining(contains)
+	case node != "":
+		pkt, ok = m.graphMgr.MostRecentPacketForNode(node)
+	default:
+		http.Error(w, "missing node or contains", http.StatusBadRequest)
+		return
+	}
+	if !ok {
+		http.Error(w, "no matching packet in buffer", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(pkt)
 }
 
 // handleGraphAPI returns the current graph snapshot as JSON
@@ -399,6 +439,40 @@ func (m *Manager) handleDownloadCurrentPcap(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", currentFile.Filename))
 
 	http.ServeFile(w, r, currentFile.Path)
+}
+
+// protocolInfo is the per-protocol shape served to the frontend legend/filter
+// UI (lowercase keys, matching the protocols.json schema).
+type protocolInfo struct {
+	Name           string `json:"name"`
+	Color          string `json:"color"`
+	Layer          string `json:"layer"`
+	LayerNum       int    `json:"layerNum"`
+	Discovery      bool   `json:"discovery"`
+	DefaultVisible bool   `json:"defaultVisible"`
+}
+
+// handleProtocols returns the active protocol catalog (ordered legend list)
+// so the frontend builds its legend, layer grouping, and default filters from
+// the server instead of hardcoded tables.
+func (m *Manager) handleProtocols(w http.ResponseWriter, r *http.Request) {
+	all := capture.GetAllProtocols()
+	out := make([]protocolInfo, len(all))
+	for i, p := range all {
+		out[i] = protocolInfo{
+			Name:           p.Name,
+			Color:          p.Color,
+			Layer:          p.Layer,
+			LayerNum:       p.LayerNum,
+			Discovery:      p.Discovery,
+			DefaultVisible: p.DefaultVisible,
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(out); err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
 }
 
 // handleListStreams returns a list of all tracked streams

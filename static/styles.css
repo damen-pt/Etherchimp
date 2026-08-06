@@ -753,6 +753,23 @@ body {
     color: var(--text-muted);
 }
 
+/* Inline autocomplete "ghost" text: overlays the input, showing the typed text
+   invisibly so the dimmed completion suffix lines up right after the caret. */
+.search-ghost {
+    position: absolute;
+    pointer-events: none;
+    white-space: pre;
+    overflow: hidden;
+    color: transparent;
+    font-size: 14px;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.search-ghost .ghost-suffix {
+    color: var(--text-muted);
+    opacity: 0.7;
+}
+
 .search-clear {
     background: transparent;
     border: none;

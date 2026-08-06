@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -62,6 +63,27 @@ const (
 	// with this separation strength. The pad leaves room for labels under nodes.
 	collisionPad      = 34.0
 	collisionStrength = 1.2
+
+	// Burst detection (NMAP-scan-class traffic spikes). The engine keeps a ring
+	// of the node-set sizes seen at the last burstWindowSteps Step calls, per
+	// mode. The force layout enters burst mode when the set has grown within
+	// that window by more than burstGrowthAbs nodes, OR by more than
+	// burstGrowthPct of the window minimum — the percentage trigger additionally
+	// requires burstGrowthPctFloor nodes so that adding a couple of nodes to a
+	// small graph (a large relative jump) is not misread as a scan burst.
+	burstWindowSteps    = 10
+	burstGrowthAbs      = 25
+	burstGrowthPct      = 0.10
+	burstGrowthPctFloor = 10
+
+	// Consecutive steps with an unchanged node set after which burst mode exits.
+	// On exit the graph gets ONE gentle reheat (at the expand-bloom temperature)
+	// so it re-balances a single time, then settles and the skip gate resumes.
+	burstStableSteps = 10
+
+	// Temperature cap during a burst, as a fraction of forceReheatTemp:
+	// newcomers arrange locally without dragging the frozen elders around.
+	burstTempFactor = 0.3
 )
 
 // LayoutEngine holds positions for every active layout mode.
@@ -71,8 +93,19 @@ type LayoutEngine struct {
 	settled   map[string]bool           // mode -> converged (force) / computed (deterministic)
 	temp      map[string]float64        // force temperature per mode
 	sig       map[string]uint64         // node-set signature per mode
+	pins      map[string]map[string]Vec // mode -> pins as of the last run step (skip gate)
 	islands   map[string][]SubnetIsland // subnet mode islands
 	rng       *rand.Rand
+
+	// Burst-mode state per mode (scan-class spikes), consulted only by the
+	// plain force branch of Step: recent node-set sizes, whether the mode is
+	// in burst mode, how many consecutive steps had an unchanged node set, and
+	// the set of nodes seeded during the current burst (the mobile newcomers;
+	// every node placed before the burst stays frozen until the burst exits).
+	sizeHist    map[string][]int
+	burst       map[string]bool
+	stableSteps map[string]int
+	burstNew    map[string]map[string]bool
 
 	// Clustered-host (gravity) island assignment, recomputed when the node set
 	// changes: each node's gravity target is its island centre, and hub nodes are
@@ -86,12 +119,17 @@ type LayoutEngine struct {
 // is reproducible across runs).
 func NewLayoutEngine() *LayoutEngine {
 	return &LayoutEngine{
-		positions: map[string]map[string]Vec{},
-		settled:   map[string]bool{},
-		temp:      map[string]float64{},
-		sig:       map[string]uint64{},
-		islands:   map[string][]SubnetIsland{},
-		rng:       rand.New(rand.NewSource(1)),
+		positions:   map[string]map[string]Vec{},
+		settled:     map[string]bool{},
+		temp:        map[string]float64{},
+		sig:         map[string]uint64{},
+		pins:        map[string]map[string]Vec{},
+		islands:     map[string][]SubnetIsland{},
+		rng:         rand.New(rand.NewSource(1)),
+		sizeHist:    map[string][]int{},
+		burst:       map[string]bool{},
+		stableSteps: map[string]int{},
+		burstNew:    map[string]map[string]bool{},
 	}
 }
 
@@ -137,18 +175,140 @@ func (le *LayoutEngine) Step(raw RawSnapshot, modes map[string]bool, pins map[st
 		case "circular":
 			le.layoutCircular(raw)
 		case "gravity":
+			if le.forceCanSkip(mode, raw, pins) {
+				continue
+			}
+			le.pins[mode] = copyPins(pins)
 			le.stepGravityIslands(raw, pins, radii)
 		case "hierarchical":
 			le.layoutHierarchical(raw)
 		case "subnet":
 			le.layoutSubnet(raw, vlanByIP)
+		case "solar":
+			// Deterministic solar-system layout for cosmos explorer (and GL).
+			// No force simulation — positions are stable across ticks.
+			le.layoutSolar(raw, pins)
 		default: // "force" and anything unknown
-			le.stepForce(raw, pins, radii, nil, "force")
+			// stepForce below keeps its state under the "force" key, so the
+			// burst bookkeeping (and the exit reheat) keys off "force" too.
+			inBurst, exitReheat := le.trackBurst("force", raw)
+			if exitReheat {
+				// The burst just ended: reheat ONCE at the gentle expand-bloom
+				// temperature so the graph re-balances a single time, then
+				// settles again and the skip gate resumes.
+				if cool := forceReheatTemp * 0.55; le.temp["force"] < cool {
+					le.temp["force"] = cool
+				}
+				le.settled["force"] = false
+			}
+			if le.forceCanSkip(mode, raw, pins) {
+				continue
+			}
+			le.pins[mode] = copyPins(pins)
+			le.stepForce(raw, pins, radii, nil, "force", inBurst)
 		}
 	}
 }
 
 // --- helpers ---
+
+// forceCanSkip reports whether a force-family mode ("force", or "gravity" which
+// wraps stepForce) can skip its relaxation step entirely: the layout has
+// converged (settled, i.e. the last step's max displacement fell below
+// forceEpsilon) AND nothing the relaxation depends on has changed since — the
+// node-set signature and the externally supplied pin positions. Skipping is a
+// pure no-op shortcut: a settled force step with unchanged inputs moves nodes
+// by less than forceEpsilon under an already-cooled temperature, so the visible
+// layout is identical. Any change (node set, reseed/reheat, pin drag, mode
+// switch) flips settled off or fails these checks and the step runs as before.
+func (le *LayoutEngine) forceCanSkip(mode string, raw RawSnapshot, pins map[string]Vec) bool {
+	if !le.settled[mode] || le.positions[mode] == nil {
+		return false
+	}
+	if le.sig[mode] != nodeSetSig(raw.Nodes) {
+		return false
+	}
+	return pinsEqual(le.pins[mode], pins)
+}
+
+// trackBurst updates the per-mode burst state for a force mode and reports
+// (1) whether the mode is currently in burst mode and (2) whether this step is
+// the burst-exit step, on which the caller performs one gentle reheat. It must
+// be called exactly once per Step for the mode, BEFORE forceCanSkip, so that
+// stability is also counted on skipped (settled) steps — otherwise a burst
+// could never end once the newcomers have settled and the gate starts skipping.
+//
+// Burst mode is entered when the node set grew within the trailing window by
+// more than burstGrowthAbs nodes, or by more than burstGrowthPct of the window
+// minimum (with a burstGrowthPctFloor absolute floor). It exits after
+// burstStableSteps consecutive steps with an unchanged node set.
+func (le *LayoutEngine) trackBurst(mode string, raw RawSnapshot) (inBurst, exitReheat bool) {
+	n := len(raw.Nodes)
+	hist := append(le.sizeHist[mode], n)
+	if len(hist) > burstWindowSteps {
+		hist = hist[len(hist)-burstWindowSteps:]
+	}
+	le.sizeHist[mode] = hist
+
+	// le.sig[mode] still holds the signature seen by the previous stepForce,
+	// so equality means the node set is unchanged since the last step.
+	if le.positions[mode] != nil && nodeSetSig(raw.Nodes) == le.sig[mode] {
+		le.stableSteps[mode]++
+	} else {
+		le.stableSteps[mode] = 0
+	}
+
+	if le.burst[mode] {
+		if le.stableSteps[mode] >= burstStableSteps {
+			le.burst[mode] = false
+			delete(le.burstNew, mode)
+			return false, true
+		}
+		return true, false
+	}
+
+	windowMin := hist[0]
+	for _, s := range hist[1:] {
+		if s < windowMin {
+			windowMin = s
+		}
+	}
+	growth := n - windowMin
+	if growth > burstGrowthAbs ||
+		(growth >= burstGrowthPctFloor && float64(growth) > burstGrowthPct*float64(windowMin)) {
+		le.burst[mode] = true
+		le.stableSteps[mode] = 0
+		le.burstNew[mode] = map[string]bool{} // filled by stepForce as it seeds
+		return true, false
+	}
+	return false, false
+}
+
+// copyPins snapshots a pins map so later caller-side mutation can't alias the
+// stored copy used by forceCanSkip. Nil and empty normalize to nil.
+func copyPins(pins map[string]Vec) map[string]Vec {
+	if len(pins) == 0 {
+		return nil
+	}
+	c := make(map[string]Vec, len(pins))
+	for id, p := range pins {
+		c[id] = p
+	}
+	return c
+}
+
+// pinsEqual compares two pins maps, treating nil and empty as equal.
+func pinsEqual(a, b map[string]Vec) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for id, p := range a {
+		if q, ok := b[id]; !ok || q != p {
+			return false
+		}
+	}
+	return true
+}
 
 func sortedIDs(nodes []Node) []string {
 	ids := make([]string, len(nodes))
@@ -243,7 +403,7 @@ func (le *LayoutEngine) stepGravityIslands(raw RawSnapshot, pins map[string]Vec,
 			merged[id] = v
 		}
 	}
-	le.stepForce(raw, merged, radii, le.gravityAnchors, mode)
+	le.stepForce(raw, merged, radii, le.gravityAnchors, mode, false)
 }
 
 // computeIslands picks the top-traffic nodes as island hubs, lays their centres
@@ -499,7 +659,12 @@ func (le *LayoutEngine) layoutSubnet(raw RawSnapshot, vlanByIP map[string]uint16
 // stepForce runs one incremental force-relaxation step for the given mode.
 // anchors gives each node a gravity target (its island centre in "gravity" mode);
 // when nil, gravity pulls every node toward the origin (plain "force" mode).
-func (le *LayoutEngine) stepForce(raw RawSnapshot, pins map[string]Vec, radii map[string]float64, anchors map[string]Vec, mode string) {
+// burst marks a scan-class spike step: nodes that were already placed stay
+// frozen in place (WITHOUT touching the user-pin path), only just-seeded
+// newcomers relax — under a capped temperature — and the global reheat on
+// node-set change is suppressed, so a burst of arrivals doesn't throw the
+// whole graph around on every tick.
+func (le *LayoutEngine) stepForce(raw RawSnapshot, pins map[string]Vec, radii map[string]float64, anchors map[string]Vec, mode string, burst bool) {
 	pos := le.positions[mode]
 	if pos == nil {
 		pos = make(map[string]Vec)
@@ -530,12 +695,35 @@ func (le *LayoutEngine) stepForce(raw RawSnapshot, pins map[string]Vec, radii ma
 		changed = true
 	}
 
-	// Seed new nodes near a connected neighbour (or on a ring if none).
+	// Seed new nodes near a connected neighbour, or — on supernode expand —
+	// in a bloom disk around the departed supernode's last position so hosts
+	// fly out of their cluster instead of teleporting from the origin.
 	neighbors := make(map[string][]string)
 	for i := range raw.Edges {
 		e := &raw.Edges[i]
 		neighbors[e.From] = append(neighbors[e.From], e.To)
 		neighbors[e.To] = append(neighbors[e.To], e.From)
+	}
+	// Snapshot departing supernode positions before we drop them.
+	departedSupers := make(map[string]Vec)
+	for id, p := range pos {
+		if idset[id] {
+			continue
+		}
+		if strings.Contains(id, "/") {
+			departedSupers[id] = p
+		}
+	}
+	// In burst mode, track which nodes were seeded during THIS burst (across
+	// steps): only those newcomers may move below; every node placed before the
+	// burst stays frozen until the burst exits.
+	var seeded map[string]bool
+	if burst {
+		seeded = le.burstNew[mode]
+		if seeded == nil {
+			seeded = make(map[string]bool)
+			le.burstNew[mode] = seeded
+		}
 	}
 	for _, id := range ids {
 		if _, ok := pos[id]; ok {
@@ -550,10 +738,22 @@ func (le *LayoutEngine) stepForce(raw RawSnapshot, pins map[string]Vec, radii ma
 				break
 			}
 		}
+		// Bloom from a departed supernode that owned this host/CIDR.
+		if !placed {
+			if p, ok := seedFromDepartedSuper(id, departedSupers); ok {
+				a := le.rng.Float64() * 2 * math.Pi
+				r := 20 + le.rng.Float64()*k*0.6
+				pos[id] = Vec{p.X + math.Cos(a)*r, p.Y + math.Sin(a)*r}
+				placed = true
+			}
+		}
 		if !placed {
 			a := le.rng.Float64() * 2 * math.Pi
 			r := le.rng.Float64() * k * math.Sqrt(float64(n))
 			pos[id] = Vec{math.Cos(a) * r, math.Sin(a) * r}
+		}
+		if burst {
+			seeded[id] = true
 		}
 		le.settled[mode] = false
 	}
@@ -570,10 +770,26 @@ func (le *LayoutEngine) stepForce(raw RawSnapshot, pins map[string]Vec, radii ma
 		}
 	}
 
+	// Local reheat (Phase 6): supernode expand (departed supers present) uses a
+	// cooler reheat so settled neighbours barely move while new hosts bloom in.
 	temp := le.temp[mode]
 	switch {
 	case wasEmpty:
 		temp = forceInitialTemp // first layout: hot for a good global arrangement
+	case burst:
+		// Burst mode: the global reheat is SUPPRESSED — node-set changes do not
+		// re-heat the graph. Newcomers relax under a capped temperature so they
+		// arrange locally without dragging the frozen elders around: on a node-set
+		// change the temperature is raised only to the cap (never forceReheatTemp).
+		if burstCap := forceReheatTemp * burstTempFactor; temp > burstCap || (changed && temp < burstCap) || temp <= 0 {
+			temp = burstCap
+		}
+	case changed && len(departedSupers) > 0:
+		// Expand bloom: gentle nudge so new hosts settle without flinging the map.
+		cool := forceReheatTemp * 0.55
+		if temp < cool {
+			temp = cool
+		}
 	case changed && temp < forceReheatTemp:
 		temp = forceReheatTemp // new nodes arrived: gentle, bounded re-settle
 	case temp <= 0:
@@ -591,6 +807,10 @@ func (le *LayoutEngine) stepForce(raw RawSnapshot, pins map[string]Vec, radii ma
 	radArr := make([]float64, n)
 	anchorArr := make([]Vec, n)
 	pinnedArr := make([]bool, n)
+	// Burst mode: nodes placed before the burst (everything not seeded during
+	// it) are frozen — they still exert forces on the newcomers but never move.
+	// This is orthogonal to user pins and touches no pin state.
+	frozenArr := make([]bool, n)
 	hasRadii := radii != nil
 	for i, id := range ids {
 		posArr[i] = pos[id]
@@ -602,6 +822,9 @@ func (le *LayoutEngine) stepForce(raw RawSnapshot, pins map[string]Vec, radii ma
 		}
 		if _, pinned := pins[id]; pinned {
 			pinnedArr[i] = true
+		}
+		if burst && !seeded[id] {
+			frozenArr[i] = true
 		}
 	}
 	// Resolve edge endpoints to indices once; skip edges with an unplaced endpoint.
@@ -627,6 +850,11 @@ func (le *LayoutEngine) stepForce(raw RawSnapshot, pins map[string]Vec, radii ma
 		for i := 0; i < n; i++ {
 			pi := posArr[i]
 			for j := i + 1; j < n; j++ {
+				// Pairs of frozen nodes can't move either way — skip them (the
+				// common case during a scan burst, and most of the O(n^2) cost).
+				if frozenArr[i] && frozenArr[j] {
+					continue
+				}
 				pj := posArr[j]
 				dx, dy := pi.X-pj.X, pi.Y-pj.Y
 				dist := math.Hypot(dx, dy)
@@ -677,7 +905,7 @@ func (le *LayoutEngine) stepForce(raw RawSnapshot, pins map[string]Vec, radii ma
 		}
 		// Integrate, capped by temperature.
 		for i := 0; i < n; i++ {
-			if pinnedArr[i] {
+			if pinnedArr[i] || frozenArr[i] {
 				continue
 			}
 			d := dispArr[i]
@@ -703,4 +931,60 @@ func (le *LayoutEngine) stepForce(raw RawSnapshot, pins map[string]Vec, radii ma
 	// so the layout still re-converges when the graph changes.
 	le.temp[mode] = temp
 	le.settled[mode] = maxDisp < forceEpsilon
+}
+
+// seedFromDepartedSuper finds a departed supernode position that likely owned
+// the newly appeared node id (host under a /24, /24 under a /16, or residual
+// tail). Returns the supernode's last position so members can bloom outward.
+func seedFromDepartedSuper(id string, departed map[string]Vec) (Vec, bool) {
+	if len(departed) == 0 {
+		return Vec{}, false
+	}
+	// Exact residual / base match first.
+	if p, ok := departed[id]; ok {
+		return p, true
+	}
+	if p, ok := departed[id+"+"]; ok {
+		return p, true
+	}
+	if strings.HasSuffix(id, "+") {
+		if p, ok := departed[strings.TrimSuffix(id, "+")]; ok {
+			return p, true
+		}
+	}
+	// Host IP -> /24 then /16 departed supernodes.
+	if ip := net.ParseIP(id); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			c24 := fmt.Sprintf("%d.%d.%d.0/24", v4[0], v4[1], v4[2])
+			if p, ok := departed[c24]; ok {
+				return p, true
+			}
+			if p, ok := departed[c24+"+"]; ok {
+				return p, true
+			}
+			c16 := fmt.Sprintf("%d.%d.0.0/16", v4[0], v4[1])
+			if p, ok := departed[c16]; ok {
+				return p, true
+			}
+			if p, ok := departed[c16+"+"]; ok {
+				return p, true
+			}
+		}
+	}
+	// Nested /24 supernode appearing after /16 expand.
+	if strings.HasSuffix(id, "/24") {
+		base := strings.TrimSuffix(id, ".0/24")
+		if base != id {
+			if dot := strings.LastIndexByte(base, '.'); dot >= 0 {
+				c16 := base[:dot] + ".0.0/16"
+				if p, ok := departed[c16]; ok {
+					return p, true
+				}
+				if p, ok := departed[c16+"+"]; ok {
+					return p, true
+				}
+			}
+		}
+	}
+	return Vec{}, false
 }

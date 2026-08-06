@@ -22,6 +22,7 @@ type SSHCaptureConfig struct {
 	PrivateKey string // Path to private key file (for key-based auth)
 	Username   string // SSH username
 	Password   string // SSH password (for password-based auth)
+	Filter     string // Optional extra BPF filter (e.g. from -net) ANDed into tcpdump
 }
 
 // SSHCapture manages packet capture from a remote host via SSH
@@ -30,13 +31,13 @@ type SSHCapture struct {
 	packetChan chan *PacketInfo
 	sshClient  *ssh.Client
 	sshSession *ssh.Session
-	pcapWriter *pcapgo.Writer
-	pcapFile   *os.File
+	pcap       *pcapWriter
 	pcapDir    string
 	enablePcap bool
 	paused     bool
 	pauseChan  chan bool
 	resumeChan chan bool
+	chanDrops  *dropCounter
 }
 
 // NewSSHCapture creates a new SSH-based packet capture instance
@@ -49,6 +50,7 @@ func NewSSHCapture(config SSHCaptureConfig, packetChan chan *PacketInfo) (*SSHCa
 		paused:     false,
 		pauseChan:  make(chan bool, 1),
 		resumeChan: make(chan bool, 1),
+		chanDrops:  newDropCounter("packet channel (ssh)"),
 	}
 
 	// Create pcaps directory if it doesn't exist
@@ -105,8 +107,8 @@ func (c *SSHCapture) Start(ctx context.Context) {
 		if c.sshClient != nil {
 			c.sshClient.Close()
 		}
-		if c.pcapFile != nil {
-			c.pcapFile.Close()
+		if c.pcap != nil {
+			c.pcap.Close()
 			log.Println("Closed pcap file")
 		}
 	}()
@@ -178,6 +180,11 @@ func (c *SSHCapture) Start(ctx context.Context) {
 	}
 	// BPF filter to exclude traffic to/from the SSH management connection
 	bpfFilter := fmt.Sprintf("not (host %s and port %s)", sshHost, sshPort)
+	// AND in the caller's subnet filter (-net) so the remote tcpdump only ships
+	// matching packets over the wire.
+	if c.config.Filter != "" {
+		bpfFilter = fmt.Sprintf("(%s) and (%s)", bpfFilter, c.config.Filter)
+	}
 	// For "-i any", force the v1 cooked link type (LINUX_SLL). Modern Linux
 	// defaults "any" to LINUX_SLL2, which our gopacket version can't decode (and
 	// its DLT 276 even overflows gopacket's uint8 LinkType); v1 (DLT 113) decodes
@@ -213,8 +220,8 @@ func (c *SSHCapture) Start(ctx context.Context) {
 // with the stream's actual link type (e.g. Ethernet for a single interface, or
 // SLL/SLL2 for `-i any`) so the saved file isn't mislabeled.
 func (c *SSHCapture) createPcapFile(linkType layers.LinkType) error {
-	if c.pcapFile != nil {
-		c.pcapFile.Close()
+	if c.pcap != nil {
+		c.pcap.Close()
 	}
 
 	timestamp := time.Now().Format("2006-01-02_15-04-05")
@@ -225,14 +232,13 @@ func (c *SSHCapture) createPcapFile(linkType layers.LinkType) error {
 		return fmt.Errorf("failed to create pcap file: %v", err)
 	}
 
-	writer := pcapgo.NewWriter(file)
-	if err := writer.WriteFileHeader(65535, linkType); err != nil {
+	pw, err := newPcapWriter(file, 65535, linkType)
+	if err != nil {
 		file.Close()
 		return fmt.Errorf("failed to write pcap header: %v", err)
 	}
 
-	c.pcapFile = file
-	c.pcapWriter = writer
+	c.pcap = pw
 
 	log.Printf("Created pcap file: %s", filename)
 	return nil
@@ -287,15 +293,16 @@ func (c *SSHCapture) processPcapStream(ctx context.Context, reader io.Reader) {
 				continue
 			}
 
-			// Write to local pcap file
-			if c.enablePcap && c.pcapWriter != nil {
-				if err := c.pcapWriter.WritePacket(ci, data); err != nil {
-					log.Printf("Warning: Failed to write packet to pcap: %v", err)
-				}
+			// Queue for async pcap write (non-blocking; drops counted inside)
+			if c.enablePcap && c.pcap != nil {
+				c.pcap.WritePacket(ci, data)
 			}
 
-			// Parse packet
-			packet := gopacket.NewPacket(data, linkType, gopacket.Default)
+			// Parse packet. Lazy + NoCopy: the parse aliases the reader's
+			// buffer (reused on the next ReadPacketData), so anything kept
+			// past this iteration must be copied — copyPayload in
+			// ProcessPacket is that copy.
+			packet := gopacket.NewPacket(data, linkType, gopacket.DecodeOptions{Lazy: true, NoCopy: true})
 			packetInfo := ProcessPacket(packet)
 			if packetInfo == nil {
 				continue
@@ -306,6 +313,7 @@ func (c *SSHCapture) processPcapStream(ctx context.Context, reader io.Reader) {
 			case c.packetChan <- packetInfo:
 			default:
 				// Channel is full, drop packet
+				c.chanDrops.add()
 			}
 		}
 	}

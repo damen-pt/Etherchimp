@@ -2,6 +2,7 @@ package stream
 
 import (
 	"bytes"
+	"container/list"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,12 @@ import (
 
 	"etherchimp/capture"
 )
+
+// maxStreamPayload caps retained payload at 64KB per direction per stream.
+// The frontend stream viewer truncates its display anyway (hex dump at 4KB,
+// ASCII preview at 2KB), so larger bodies only cost memory — and at 1000
+// streams the old 1MB/direction cap dominated process memory growth.
+const maxStreamPayload = 64 * 1024
 
 // Summary-extraction regexes, compiled once at package init rather than per packet
 // (generateSummary runs on every packet of an HTTP/SMTP stream).
@@ -51,11 +58,28 @@ const (
 
 // StreamPacket represents a single packet in a stream
 type StreamPacket struct {
-	Timestamp  time.Time `json:"timestamp"`
-	Direction  string    `json:"direction"` // "request" or "response"
-	Length     int       `json:"length"`
-	Payload    []byte    `json:"-"`       // Raw payload (not serialized directly)
-	PayloadB64 string    `json:"payload"` // Base64 encoded for JSON
+	Timestamp time.Time `json:"timestamp"`
+	Direction string    `json:"direction"` // "request" or "response"
+	Length    int       `json:"length"`
+	Payload   []byte    `json:"-"` // Raw payload (base64-encoded lazily at serve time)
+}
+
+// MarshalJSON serializes a StreamPacket, base64-encoding the raw payload at
+// serve time. Streams store raw bytes only; encoding per packet at ingest
+// would duplicate the base64 work graph/packet_store.go already does on the
+// same bytes. The JSON shape is unchanged ("payload" stays a base64 string).
+func (p StreamPacket) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Timestamp time.Time `json:"timestamp"`
+		Direction string    `json:"direction"`
+		Length    int       `json:"length"`
+		Payload   string    `json:"payload"`
+	}{
+		Timestamp: p.Timestamp,
+		Direction: p.Direction,
+		Length:    p.Length,
+		Payload:   base64.StdEncoding.EncodeToString(p.Payload),
+	})
 }
 
 // Stream represents a TCP or UDP stream
@@ -75,6 +99,9 @@ type Stream struct {
 	Summary      string         `json:"summary"`
 	RequestData  []byte         `json:"-"`
 	ResponseData []byte         `json:"-"`
+	// orderElem is the stream's position in the Manager's LRU list (front =
+	// least recently seen). Unexported; managed under the Manager's lock.
+	orderElem *list.Element
 }
 
 // StreamInfo is a lightweight version for listing
@@ -105,6 +132,7 @@ type StreamDetail struct {
 // Manager manages stream tracking and reconstruction
 type Manager struct {
 	streams    map[string]*Stream
+	order      *list.List // stream IDs, least-recently-seen at the front
 	maxStreams int
 	mu         sync.RWMutex
 }
@@ -116,6 +144,7 @@ func NewManager(maxStreams int) *Manager {
 	}
 	return &Manager{
 		streams:    make(map[string]*Stream),
+		order:      list.New(),
 		maxStreams: maxStreams,
 	}
 }
@@ -178,7 +207,12 @@ func (m *Manager) AddPacket(pkt *capture.PacketInfo) {
 			LastSeen:  now,
 			Packets:   make([]StreamPacket, 0),
 		}
+		stream.orderElem = m.order.PushBack(streamID)
 		m.streams[streamID] = stream
+	} else {
+		// Activity moves the stream to the back of the LRU list, keeping the
+		// front pointed at the least-recently-seen stream for O(1) eviction.
+		m.order.MoveToBack(stream.orderElem)
 	}
 
 	// Determine packet direction
@@ -187,58 +221,65 @@ func (m *Manager) AddPacket(pkt *capture.PacketInfo) {
 		direction = "response"
 	}
 
-	// Add packet to stream. Only build the stored record (and pay the base64
-	// encode) when there's room — packets past the 500 cap are dropped, so
-	// encoding them would be wasted work.
+	// Add packet to stream. Only build the stored record when there's room —
+	// packets past the 500 cap are dropped, so keeping them would be waste.
+	// The payload is stored raw; base64 encoding happens lazily at serve time
+	// (StreamPacket.MarshalJSON) instead of per packet here.
 	if len(stream.Packets) < 500 {
 		stream.Packets = append(stream.Packets, StreamPacket{
-			Timestamp:  now,
-			Direction:  direction,
-			Length:     len(pkt.Payload),
-			Payload:    pkt.Payload,
-			PayloadB64: base64.StdEncoding.EncodeToString(pkt.Payload),
+			Timestamp: now,
+			Direction: direction,
+			Length:    len(pkt.Payload),
+			Payload:   pkt.Payload,
 		})
 	}
 
-	// Accumulate payload data
+	// Accumulate payload data (capped per direction). Note whether this packet
+	// delivered the first bytes in its direction: the summary can only change
+	// then or when the protocol classification changes, so those are the only
+	// times it is recomputed below.
+	firstBytes := len(pkt.Payload) > 0 &&
+		((direction == "request" && len(stream.RequestData) == 0) ||
+			(direction == "response" && len(stream.ResponseData) == 0))
 	if direction == "request" {
-		stream.RequestData = append(stream.RequestData, pkt.Payload...)
+		stream.RequestData = appendCapped(stream.RequestData, pkt.Payload)
 	} else {
-		stream.ResponseData = append(stream.ResponseData, pkt.Payload...)
-	}
-
-	// Limit payload sizes (1MB each)
-	if len(stream.RequestData) > 1024*1024 {
-		stream.RequestData = stream.RequestData[:1024*1024]
-	}
-	if len(stream.ResponseData) > 1024*1024 {
-		stream.ResponseData = stream.ResponseData[:1024*1024]
+		stream.ResponseData = appendCapped(stream.ResponseData, pkt.Payload)
 	}
 
 	stream.PacketCount++
 	stream.ByteCount += int64(pkt.Length)
 	stream.LastSeen = now
 
-	// Detect protocol and update summary
-	stream.Protocol = detectProtocol(pkt, stream)
-	stream.Summary = generateSummary(stream)
+	// Detect protocol; recompute the summary only when it can actually change
+	// (first payload bytes in either direction, or a protocol change) rather
+	// than on every packet. Trade-off: the packet/byte counts embedded in the
+	// default and DNS summaries freeze at their last recompute instead of
+	// ticking per packet — StreamInfo.PacketCount/ByteCount stay live.
+	newProtocol := detectProtocol(pkt, stream)
+	if newProtocol != stream.Protocol || firstBytes || stream.Summary == "" {
+		stream.Protocol = newProtocol
+		stream.Summary = generateSummary(stream)
+	}
 }
 
-// evictOldestStream removes the oldest stream
+// appendCapped appends src to dst, never growing dst past maxStreamPayload.
+func appendCapped(dst, src []byte) []byte {
+	if room := maxStreamPayload - len(dst); room > 0 {
+		dst = append(dst, src[:min(room, len(src))]...)
+	}
+	return dst
+}
+
+// evictOldestStream removes the least-recently-seen stream (the front of the
+// LRU list) in O(1).
 func (m *Manager) evictOldestStream() {
-	var oldestID string
-	var oldestTime time.Time
-
-	for id, stream := range m.streams {
-		if oldestID == "" || stream.LastSeen.Before(oldestTime) {
-			oldestID = id
-			oldestTime = stream.LastSeen
-		}
+	front := m.order.Front()
+	if front == nil {
+		return
 	}
-
-	if oldestID != "" {
-		delete(m.streams, oldestID)
-	}
+	m.order.Remove(front)
+	delete(m.streams, front.Value.(string))
 }
 
 // detectProtocol identifies the application protocol
@@ -456,7 +497,7 @@ func (m *Manager) GetStream(id string) (*StreamDetail, error) {
 			ByteCount:   stream.ByteCount,
 			Summary:     stream.Summary,
 		},
-		Packets:         stream.Packets,
+		Packets:         append([]StreamPacket(nil), stream.Packets...), // copy under lock: marshaling (and its lazy base64) happens after unlock
 		RequestPayload:  base64.StdEncoding.EncodeToString(stream.RequestData),
 		ResponsePayload: base64.StdEncoding.EncodeToString(stream.ResponseData),
 		DecodedContent:  decodeStreamContent(stream),
@@ -596,6 +637,7 @@ func (m *Manager) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.streams = make(map[string]*Stream)
+	m.order = list.New()
 }
 
 // GetStats returns stream statistics
