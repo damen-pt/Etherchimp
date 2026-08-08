@@ -1,0 +1,1832 @@
+diff --git a/static/app.js b/static/app.js
+index 20dafe9..a3d7566 100644
+--- a/static/app.js
++++ b/static/app.js
+@@ -60,7 +60,7 @@ const PROTOCOL_LAYERS = [
+ // topology, routing, and zero-config discovery noise (mDNS, SSDP, LLMNR, …)
+ // stay hidden until the user checks them to include that traffic.
+ const DEFAULT_VISIBLE_PROTOCOLS = new Set([
+-    'ARP', 'ICMP', 'TCP', 'UDP', 'HTTP', 'HTTPS', 'DNS', 'SSH', 'WireGuard', 'OpenVPN'
++    'ICMP', 'TCP', 'UDP', 'HTTP', 'HTTPS', 'DNS'
+     // K8s · Cluster (VXLAN/Geneve/K8s-API/etcd/Kubelet) stays off by default.
+ ]);
+ 
+@@ -99,12 +99,51 @@ let fitOnNextFull = false;
+ // Focus mode: hovering/clicking a node highlights it + neighbours, dims the rest.
+ let focusActive = false;
+ let focusPinned = false; // true when a click locked focus (hover won't change it)
++let focusKeepNodes = null; // Set of node ids kept bright while focus is active
++let focusKeepEdges = null; // Set of edge ids kept bright while focus is active
++
++// Latest server data per node/edge id. Tooltips, details panels, and search read
++// live counts from here, so count-only changes never need to touch the vis
++// DataSet (whose update path deep-merges, re-parses and redraws per item).
++let nodeMeta = new Map(); // id -> latest server ViewNode
++let edgeMeta = new Map(); // id -> latest server ViewEdge
++
++// Render signature per id: a string of everything that affects how the item is
++// drawn. A delta whose signature matches the last applied one is data-only
++// (counters ticking up) and skips the DataSet entirely.
++let lastNodeSig = new Map(); // id -> render signature string
++let lastEdgeSig = new Map(); // id -> render signature string
++
++// Node currently under the pointer (for async tooltip enrichment) and the node
++// the details panel is showing (for async detail re-render).
++let lastHoverNodeId = null;
++let detailsNodeId = null;
++
++// Phase 4 subnet aggregation: /24 CIDRs the user expanded back into hosts.
++// Mirrors the server's per-client ExpandedSubnets (we initiate every change and
++// re-sync the full set on connect, so the two can't drift).
++let expandedSubnets = new Set();
++
++// The performance tier currently applied to the network options; re-applied via
++// network.setOptions only when the node count crosses a tier boundary.
++let currentTier = null;
++// Edge labels are hidden above this node count (label text is the most expensive
++// thing vis draws per edge).
++const EDGE_LABEL_MAX_NODES = 100;
++let edgeLabelsVisible = true;
+ 
+ // Traffic flow particles: small dots that travel along edges in the real packet
+ // direction, fed by the server's per-tick trafficFlows. Etherape-style.
+ let activeFlows = [];        // {from, to, color, progress, speed}
+ let flowAnimationActive = false;
+ const MAX_FLOW_PARTICLES = 220;
++// Particles represent SIGNIFICANT traffic only: a flow needs at least this
++// many packets in its ~100ms server tick (≈30 pkt/s) to spawn one, and speed
++// scales with volume — light flows drift, heavy flows zip.
++const FLOW_MIN_PACKETS = 3;
++function flowParticleSpeed(packets) {
++    return Math.min(0.05, Math.max(0.005, 0.005 + Math.log10((packets || 1) + 1) * 0.014));
++}
+ 
+ const MAX_CACHED_PACKETS = 5000; // Keep last 5000 packets in memory
+ 
+@@ -112,6 +151,7 @@ const MAX_CACHED_PACKETS = 5000; // Keep last 5000 packets in memory
+ let searchWorker = null;
+ let searchRequestId = 0;
+ let pendingSearchCallback = null;
++let serverSearchId = 0; // discards stale /api/search responses
+ 
+ function initSearchWorker() {
+     try {
+@@ -180,6 +220,11 @@ function init() {
+     connectWebSocket();
+     // Poll for new packets (the live table is fed by fetch now, not WS push).
+     setInterval(pollPackets, 1000);
++    // Position easing snaps (and its rAF loop pauses) while the tab is hidden;
++    // resume smooth animation when the tab becomes visible again.
++    document.addEventListener('visibilitychange', function() {
++        if (!document.hidden) startPositionAnimation();
++    });
+ }
+ 
+ // Performance tier thresholds
+@@ -197,87 +242,14 @@ function getPerformanceTier(nodeCount) {
+     return 'maximum';
+ }
+ 
+-// Get physics settings based on performance tier
+-// Tuned for orbital spacing - popular nodes repel strongly, spread into orbits
+-function getPhysicsSettings(tier) {
+-    const settings = {
+-        low: {
+-            stabilization: { iterations: 100, updateInterval: 25 },
+-            barnesHut: {
+-                gravitationalConstant: -10000,  // Very strong repulsion - nodes push apart
+-                centralGravity: 0.1,            // Weak center pull - allows spreading
+-                springLength: 300,              // Very long springs
+-                springConstant: 0.005,          // Extremely soft springs - repulsion wins
+-                damping: 0.15,                  // Smooth movement
+-                avoidOverlap: 1.0
+-            },
+-            timestep: 0.35,
+-            minVelocity: 0.1
+-        },
+-        medium: {
+-            stabilization: { iterations: 80, updateInterval: 50 },
+-            barnesHut: {
+-                gravitationalConstant: -8000,
+-                centralGravity: 0.1,
+-                springLength: 280,
+-                springConstant: 0.005,
+-                damping: 0.15,
+-                avoidOverlap: 1.0
+-            },
+-            timestep: 0.35,
+-            minVelocity: 0.1
+-        },
+-        high: {
+-            stabilization: { iterations: 50, updateInterval: 100 },
+-            barnesHut: {
+-                gravitationalConstant: -6000,
+-                centralGravity: 0.15,
+-                springLength: 250,
+-                springConstant: 0.008,
+-                damping: 0.18,
+-                avoidOverlap: 0.9
+-            },
+-            timestep: 0.4,
+-            minVelocity: 0.15
+-        },
+-        extreme: {
+-            stabilization: { iterations: 30, updateInterval: 100 },
+-            barnesHut: {
+-                gravitationalConstant: -5000,
+-                centralGravity: 0.2,
+-                springLength: 220,
+-                springConstant: 0.01,
+-                damping: 0.2,
+-                avoidOverlap: 0.8
+-            },
+-            timestep: 0.45,
+-            minVelocity: 0.2
+-        },
+-        maximum: {
+-            stabilization: { iterations: 20, updateInterval: 200 },
+-            barnesHut: {
+-                gravitationalConstant: -4000,
+-                centralGravity: 0.25,
+-                springLength: 180,
+-                springConstant: 0.015,
+-                damping: 0.25,
+-                avoidOverlap: 0.7
+-            },
+-            timestep: 0.5,
+-            minVelocity: 0.3
+-        }
+-    };
+-    return settings[tier] || settings.medium;
+-}
+-
+ // Get theme-aware network options
+ function getNetworkOptions() {
+     const isLightTheme = document.body.classList.contains('light-theme');
+-    const nodeCount = nodes.getIds().length;
++    const nodeCount = nodes.length;
+ 
+-    // Adaptive performance settings based on node count
++    // Adaptive visual-quality settings based on node count. (Physics runs on the
++    // server — see graph/layout.go — so there are no physics settings here.)
+     const tier = getPerformanceTier(nodeCount);
+-    const physicsSettings = getPhysicsSettings(tier);
+ 
+     // Visual quality settings based on tier
+     const shadowsEnabled = tier === 'low';
+@@ -379,13 +351,35 @@ function getNetworkOptions() {
+     };
+ }
+ 
+-// Setup vis.js network
++// Setup the graph renderer: the WebGL renderer (static/glrenderer.js) is the
++// DEFAULT wherever WebGL2 is available; vis.Network remains as the automatic
++// fallback and can be forced with ?renderer=vis / localStorage.renderer='vis'.
++// ?renderer=cosmos opts into the cosmos.gl renderer (GPU force layout in the
++// browser — static/cosmosrenderer.js); it sets network.ownsLayout, which turns
++// off everything that assumes server-owned positions (position frames, flow
++// particles, subnet islands). All renderers implement the same API surface, so
++// everything below is renderer-agnostic.
+ function setupNetwork() {
+     const container = document.getElementById('network');
+     const data = { nodes: nodes, edges: edges };
+     const options = getNetworkOptions();
+ 
+-    network = new vis.Network(container, data, options);
++    const rendererParam = new URLSearchParams(window.location.search).get('renderer');
++    const stored = localStorage.getItem('renderer');
++    const wantCosmos = rendererParam === 'cosmos' ||
++        (rendererParam == null && stored === 'cosmos');
++    const wantVis = rendererParam === 'vis' ||
++        (rendererParam !== 'gl' && !wantCosmos && stored === 'vis');
++    if (wantCosmos && window.CosmosNetwork && CosmosNetwork.isSupported()) {
++        network = new CosmosNetwork(container, data, options);
++        console.log('Renderer: cosmos.gl (GPU force layout)');
++    } else if (!wantVis && window.GLNetwork && GLNetwork.isSupported()) {
++        network = new GLNetwork(container, data, options);
++        console.log('Renderer: WebGL (GLNetwork)' + (wantCosmos ? ' [cosmos unavailable]' : ''));
++    } else {
++        network = new vis.Network(container, data, options);
++        console.log('Renderer: vis-network (Canvas2D)' + (wantVis ? ' [forced]' : ' [WebGL2 unavailable]'));
++    }
+ 
+     // Draw the dotted blue subnet rings beneath the nodes/edges. Runs on every
+     // redraw; cheap no-op unless the Clustered Subnet layout populated islands.
+@@ -414,13 +408,88 @@ function setupNetwork() {
+     });
+ 
+     // Hover highlights a node + its neighbours and dims the rest, unless a click
+-    // has pinned focus on something.
++    // has pinned focus on something. Tooltips are built lazily right here from
++    // the meta maps — never precomputed per delta.
+     network.on('hoverNode', function(params) {
+         if (!focusPinned) focusNode(params.node, false);
++        lastHoverNodeId = params.node;
++        let meta = nodeMeta.get(params.node);
++        if (!meta && network.rawMode) {
++            // Raw-scale mode keeps no per-node meta; synthesize a minimal one on
++            // hover (bounded by interaction) so the tooltip + lazy /api/node
++            // enrichment work.
++            meta = { id: params.node, label: params.node, ips: [params.node],
++                packetCount: 0, byteCount: 0 };
++            nodeMeta.set(params.node, meta);
++        }
++        if (meta) {
++            showGraphTooltipAt(formatNodeTooltip(meta),
++                network.canvasToDOM(network.getPosition(params.node)));
++            // Enrich lazily: the stream is slim (no IPs/deviceInfo); fetch the
++            // full record and refresh the tooltip if still hovering this node.
++            if (!meta.detailLoaded && !meta.isSubnet) {
++                fetchNodeDetail(params.node).then(m => {
++                    if (m && lastHoverNodeId === params.node) {
++                        showGraphTooltipAt(formatNodeTooltip(m),
++                            network.canvasToDOM(network.getPosition(params.node)));
++                    }
++                });
++            }
++        }
+     });
+     network.on('blurNode', function() {
+         if (!focusPinned) clearFocus();
++        lastHoverNodeId = null;
++        hideGraphTooltip();
++    });
++    network.on('hoverEdge', function(params) {
++        const meta = edgeMeta.get(params.edge);
++        if (!meta) return;
++        const ps = network.getPositions([meta.from, meta.to]);
++        const a = ps[meta.from], b = ps[meta.to];
++        if (!a || !b) return;
++        showGraphTooltipAt(formatEdgeTooltip(meta),
++            network.canvasToDOM({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }));
+     });
++    network.on('blurEdge', hideGraphTooltip);
++    network.on('dragStart', hideGraphTooltip);
++    network.on('zoom', hideGraphTooltip);
++}
++
++// --- Lazy graph tooltip --------------------------------------------------------
++// One reusable div, filled on hover from the meta maps. Replaces vis's built-in
++// title tooltips, which required building tooltip strings for every node/edge on
++// every update whether or not anything was ever hovered.
++let graphTooltipEl = null;
++function ensureGraphTooltip() {
++    if (!graphTooltipEl) {
++        graphTooltipEl = document.createElement('div');
++        graphTooltipEl.className = 'graph-tooltip';
++        graphTooltipEl.style.display = 'none';
++        document.body.appendChild(graphTooltipEl);
++    }
++    return graphTooltipEl;
++}
++
++// Show the tooltip near a DOM-space position (relative to the network container).
++function showGraphTooltipAt(text, domPos) {
++    const net = document.getElementById('network');
++    if (!net) return;
++    const el = ensureGraphTooltip();
++    el.textContent = text;
++    el.style.display = 'block';
++    const rect = net.getBoundingClientRect();
++    let x = rect.left + domPos.x + 14;
++    let y = rect.top + domPos.y + 14;
++    // Flip to keep the tooltip on screen.
++    if (x + el.offsetWidth > window.innerWidth - 8) x = Math.max(8, x - el.offsetWidth - 28);
++    if (y + el.offsetHeight > window.innerHeight - 8) y = Math.max(8, y - el.offsetHeight - 28);
++    el.style.left = x + 'px';
++    el.style.top = y + 'px';
++}
++
++function hideGraphTooltip() {
++    if (graphTooltipEl) graphTooltipEl.style.display = 'none';
+ }
+ 
+ // Render the node-encoding legend (role shapes/colors, size meaning, and the
+@@ -869,10 +938,14 @@ function performSearch(query) {
+             });
+         }
+ 
+-        // Search in tooltip data (contains packets, bytes, etc.)
+-        if (node.title && node.title.toLowerCase().includes(queryLower)) {
+-            const titleMatches = extractTitleMatches(node.title, query);
+-            matches.push(...titleMatches);
++        // Search the tooltip text (role, link info, packets, bytes, …), built on
++        // demand from the meta map — vis items no longer carry a title.
++        const meta = nodeMeta.get(node.id);
++        if (meta) {
++            const title = formatNodeTooltip(meta);
++            if (title.toLowerCase().includes(queryLower)) {
++                matches.push(...extractTitleMatches(title, query));
++            }
+         }
+ 
+         if (matches.length > 0) {
+@@ -881,8 +954,8 @@ function performSearch(query) {
+                 label: node.label || node.id,
+                 ip: node.id,
+                 matches: matches,
+-                packetCount: extractPacketCount(node.title),
+-                byteCount: extractByteCount(node.title)
++                packetCount: meta ? (meta.packetCount || 0) : 0,
++                byteCount: meta ? formatBytes(meta.byteCount || 0) : ''
+             });
+         }
+     });
+@@ -912,13 +985,14 @@ function performSearch(query) {
+             if (existingResult) {
+                 existingResult.matches.push(...matches);
+             } else {
++                const meta = nodeMeta.get(nodeId);
+                 results.push({
+                     nodeId: nodeId,
+                     label: node.label || node.id,
+                     ip: node.id,
+                     matches: matches,
+-                    packetCount: extractPacketCount(node.title),
+-                    byteCount: extractByteCount(node.title)
++                    packetCount: meta ? (meta.packetCount || 0) : 0,
++                    byteCount: meta ? formatBytes(meta.byteCount || 0) : ''
+                 });
+             }
+         }
+@@ -927,6 +1001,34 @@ function performSearch(query) {
+     // Display node/edge results immediately
+     displaySearchResults(results, query);
+ 
++    // Server-side search over the WHOLE graph (Phase 5): hosts hidden inside
++    // collapsed subnets or beyond the top-N view are invisible to the local
++    // scan above, so merge the server's matches in asynchronously.
++    const serverQueryId = ++serverSearchId;
++    fetch('/api/search?q=' + encodeURIComponent(query) + '&limit=20')
++        .then(r => r.ok ? r.json() : null)
++        .then(data => {
++            if (!data || !data.results || serverQueryId !== serverSearchId) return;
++            let added = 0;
++            for (const sr of data.results) {
++                if (results.find(r => r.nodeId === sr.id)) continue;
++                results.push({
++                    nodeId: sr.id,
++                    label: sr.label || sr.id,
++                    ip: sr.id,
++                    matches: [{ type: nodes.get(sr.id) ? 'Host' : 'Hidden host', value: (sr.ips || [sr.id]).join(', ') }],
++                    packetCount: sr.packetCount || 0,
++                    byteCount: formatBytes(sr.byteCount || 0),
++                    // Subnet chain for un-collapsing when the user focuses it.
++                    subnet24: sr.subnet24,
++                    subnet16: sr.subnet16
++                });
++                added++;
++            }
++            if (added > 0) displaySearchResults(results, query);
++        })
++        .catch(() => { /* best-effort */ });
++
+     // Search packet payloads asynchronously via Web Worker
+     if (searchWorker && packetCache.size > 0) {
+         const allCachedPackets = Array.from(packetCache.values());
+@@ -941,13 +1043,14 @@ function performSearch(query) {
+                 let result = results.find(r => r.nodeId === wr.src);
+                 if (!result) {
+                     const node = nodes.get(wr.src);
++                    const meta = nodeMeta.get(wr.src);
+                     result = {
+                         nodeId: wr.src,
+                         label: node ? (node.label || wr.src) : wr.src,
+                         ip: wr.src,
+                         matches: [],
+-                        packetCount: node ? extractPacketCount(node.title) : 0,
+-                        byteCount: node ? extractByteCount(node.title) : ''
++                        packetCount: meta ? (meta.packetCount || 0) : 0,
++                        byteCount: meta ? formatBytes(meta.byteCount || 0) : ''
+                     };
+                     results.push(result);
+                 }
+@@ -1096,14 +1199,53 @@ function extractTitleMatches(title, query) {
+     return matches;
+ }
+ 
+-// Extract packet count from title
+-function extractPacketCount(title) {
+-    if (!title) return 0;
+-    const match = title.match(/Packets:\s*(\d+)/);
+-    return match ? parseInt(match[1]) : 0;
++// Live packet count for a vis node: the meta map has the freshest server value
++// (vis items only refresh on visible style changes).
++function metaPacketCount(node) {
++    if (!node) return 0;
++    const meta = nodeMeta.get(node.id);
++    return (meta ? meta.packetCount : node.packetCount) || 0;
++}
++
++// Tooltip text for a node id, built on demand from the meta map (vis items no
++// longer carry a precomputed title). Used by search and game mode.
++function nodeTooltipFor(id) {
++    const meta = nodeMeta.get(id);
++    return meta ? formatNodeTooltip(meta) : '';
+ }
+ 
+-// Extract byte count from title
++// --- Lazy node detail (Phase 5) -------------------------------------------
++// The stream carries only render-relevant fields; IPs, deviceInfo and the
++// connection summary are fetched from /api/node on demand (hover, details
++// panel) and merged into the meta map. One in-flight fetch per node.
++const nodeDetailPending = new Set();
++async function fetchNodeDetail(nodeId) {
++    const meta = nodeMeta.get(nodeId);
++    if (meta && meta.detailLoaded) return meta;
++    if (nodeDetailPending.has(nodeId)) return meta;
++    nodeDetailPending.add(nodeId);
++    try {
++        const resp = await fetch('/api/node?id=' + encodeURIComponent(nodeId));
++        if (!resp.ok) return meta;
++        const d = await resp.json();
++        const m = nodeMeta.get(nodeId);
++        if (!m) return null; // node left the view while fetching
++        m.ips = d.ips;
++        m.deviceInfo = d.deviceInfo;
++        m.role = m.role || d.role;
++        m.peers = d.peers;
++        m.detailEdges = d.edges;
++        m.detailLoaded = true;
++        return m;
++    } catch (e) {
++        return meta;
++    } finally {
++        nodeDetailPending.delete(nodeId);
++    }
++}
++
++// Extract the formatted byte count from a synthesized tooltip (game mode keeps
++// tooltip text in its node data map).
+ function extractByteCount(title) {
+     if (!title) return '';
+     const match = title.match(/Bytes:\s*([\d\.]+ [A-Z]+)/);
+@@ -1236,10 +1378,34 @@ function escapeRegex(string) {
+     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+ }
+ 
+-// Focus on a specific node
++// Focus on a specific node. If the node is hidden inside collapsed subnet
++// supernodes (Phase 5 server search can return such hosts), expand its /16 and
++// /24 first and focus once the resynced view contains it.
+ function focusOnNode(nodeId) {
+     if (!network) return;
+ 
++    if (!nodes.get(nodeId)) {
++        const fake = { id: nodeId, ips: [nodeId] };
++        const c24 = hostSubnet24(fake);
++        const c16 = subnet16Of(fake);
++        if (!c24 && !c16) return; // not derivable; nothing to expand
++        if (c16) expandedSubnets.add(c16);
++        if (c24) expandedSubnets.add(c24);
++        sendAggregation();
++        // Focus when the expanded view arrives (poll briefly; full resync is
++        // typically 1-2 ticks away).
++        let tries = 0;
++        const wait = setInterval(() => {
++            if (nodes.get(nodeId)) {
++                clearInterval(wait);
++                focusOnNode(nodeId);
++            } else if (++tries > 20) {
++                clearInterval(wait);
++            }
++        }, 250);
++        return;
++    }
++
+     // Select the node
+     network.selectNodes([nodeId]);
+ 
+@@ -1310,10 +1476,13 @@ function applyTheme(theme) {
+         }
+     });
+ 
+-    // Update network graph with new theme colors
++    // Update network graph with new theme colors. recolorAllNodes restyles the
++    // per-node colors in place and invalidates the render signatures (which embed
++    // the theme-dependent color), so idle nodes don't keep the old palette.
+     if (network) {
+         const options = getNetworkOptions();
+         network.setOptions(options);
++        recolorAllNodes();
+     }
+ }
+ 
+@@ -1932,6 +2101,43 @@ function sendFilters() {
+     sendControl({ type: 'setFilters', data: { hidden: [...protocolFilters] } });
+ }
+ 
++// Sync the full Phase 4 aggregation state: activation threshold (0 = server
++// default of 300 hosts; override via localStorage.aggThreshold) and the set of
++// expanded /24s. Idempotent, so it's safe to resend on reconnect.
++function sendAggregation() {
++    const threshold = parseInt(localStorage.getItem('aggThreshold') || '0', 10) || 0;
++    sendControl({ type: 'setAggregation', data: { threshold: threshold, expanded: [...expandedSubnets] } });
++}
++
++// Expand a collapsed subnet supernode into its member hosts / collapse it back.
++function handleSubnetExpand(cidr) {
++    expandedSubnets.add(cidr);
++    sendAggregation();
++    hideDetails();
++}
++function handleSubnetCollapse(cidr) {
++    expandedSubnets.delete(cidr);
++    sendAggregation();
++    hideDetails();
++}
++
++// The /24 CIDR for a host node's primary IPv4 address ('' when not IPv4).
++function hostSubnet24(node) {
++    const ips = (node.ips && node.ips.length ? node.ips : [node.id]) || [];
++    for (const ip of ips) {
++        const m = /^(\d+)\.(\d+)\.(\d+)\.\d+$/.exec(ip);
++        if (m) return `${m[1]}.${m[2]}.${m[3]}.0/24`;
++    }
++    return '';
++}
++
++// The /16 CIDR above a host node or a /24 CIDR string ('' when not IPv4).
++function subnet16Of(cidrOrNode) {
++    const s = typeof cidrOrNode === 'string' ? cidrOrNode : hostSubnet24(cidrOrNode);
++    const m = /^(\d+)\.(\d+)\./.exec(s);
++    return m ? `${m[1]}.${m[2]}.0.0/16` : '';
++}
++
+ // Send a control message to the server if the socket is open.
+ function sendControl(msg) {
+     if (ws && ws.readyState === WebSocket.OPEN) {
+@@ -1980,19 +2186,60 @@ function connectWebSocket() {
+     updateConnectionStatus('Connecting...', false);
+ 
+     ws = new WebSocket(wsUrl);
++    // Position frames arrive as binary (see applyPositionFrame).
++    ws.binaryType = 'arraybuffer';
+ 
+     ws.onopen = function() {
+         console.log('WebSocket connected');
+         updateConnectionStatus('Connected', true);
+-        // Sync our filter set and layout mode so the server's view of this
+-        // client matches the UI (and survives reconnects).
++        // Sync our filter set, layout mode and aggregation state so the
++        // server's view of this client matches the UI (and survives reconnects).
+         sendFilters();
+         sendLayout(localStorage.getItem('clusterLayout') || 'force');
++        sendAggregation();
++        // Restore timeline mode across reconnects (module at end of file).
++        if (typeof timeline !== 'undefined' && timeline.active) {
++            sendTimelinePosition(true);
++        }
++        // Raw-scale mode (?scale=raw, cosmos renderer only): ask the server to
++        // stream the full unaggregated topology as binary frames.
++        if (network && network.ownsLayout &&
++            new URLSearchParams(window.location.search).get('scale') === 'raw') {
++            sendControl({ type: 'setViewMode', data: { mode: 'raw' } });
++        }
+     };
+ 
++    // Three message kinds (Phase 2 wire split):
++    //  - binary        -> position frame, fast path, no JSON parse
++    //  - {type:counts} -> 1s counter refresh for meta/stats/legend
++    //  - anything else -> style/topology delta (or full snapshot)
+     ws.onmessage = function(event) {
+         try {
++            if (event.data instanceof ArrayBuffer) {
++                wireStats.bytesIn += event.data.byteLength;
++                // Dispatch on the frame-type byte: 1 = positions, 2 = raw topology.
++                if (new DataView(event.data).getUint8(0) === 2) {
++                    applyRawTopologyFrame(event.data);
++                } else {
++                    applyPositionFrame(event.data);
++                }
++                return;
++            }
++            wireStats.bytesIn += event.data.length;
+             const data = JSON.parse(event.data);
++            if (data.type === 'counts') {
++                applyCountsFrame(data);
++                return;
++            }
++            if (data.type === 'rawMeta') {
++                // Protocol table + stats preceding each raw topology frame.
++                rawProtoTable = data.protos || [];
++                if (data.stats) {
++                    updateStatistics(data.stats.nodeCount, data.stats.edgeCount, data.stats.totalPackets);
++                }
++                return;
++            }
++            wireStats.deltas++;
+             throttledUpdateGraph(data);
+         } catch (e) {
+             console.error('Error processing WebSocket message:', e);
+@@ -2013,6 +2260,117 @@ function connectWebSocket() {
+     };
+ }
+ 
++// --- Phase 2 wire protocol: binary position frames + 1s counts frames ----------
++
++const wireTextDecoder = new TextDecoder();
++// Lightweight wire instrumentation; inspect via window.__wireStats in devtools.
++const wireStats = { deltas: 0, posFrames: 0, posNodes: 0, countsFrames: 0, bytesIn: 0, rawFrames: 0 };
++window.__wireStats = wireStats;
++
++// Raw-scale mode: protoIdx -> {name, color} table from the last rawMeta message.
++let rawProtoTable = [];
++
++// Decode a raw topology frame (msgType=2, see server/rawstream.go) and hand it
++// to the cosmos renderer as typed arrays — no DataSets, no per-node objects.
++// Format (little-endian): [u8=2][u32 n]{[u16 idLen][id][u8 tier][u8 flags]}
++//                          [u32 m]{[u32 a][u32 b][u8 protoIdx]}
++function applyRawTopologyFrame(buf) {
++    if (!network || typeof network.setRawTopology !== 'function') return;
++    const dv = new DataView(buf);
++    let off = 1;
++    const n = dv.getUint32(off, true); off += 4;
++    const ids = new Array(n);
++    const tiers = new Uint8Array(n);
++    const flags = new Uint8Array(n);
++    for (let i = 0; i < n; i++) {
++        const idLen = dv.getUint16(off, true); off += 2;
++        ids[i] = wireTextDecoder.decode(new Uint8Array(buf, off, idLen)); off += idLen;
++        tiers[i] = dv.getUint8(off);
++        flags[i] = dv.getUint8(off + 1);
++        off += 2;
++    }
++    const m = dv.getUint32(off, true); off += 4;
++    const links = new Float32Array(m * 2); // cosmos setLinks takes float indices
++    const protoIdx = new Uint8Array(m);
++    for (let i = 0; i < m; i++) {
++        links[i * 2] = dv.getUint32(off, true);
++        links[i * 2 + 1] = dv.getUint32(off + 4, true);
++        protoIdx[i] = dv.getUint8(off + 8);
++        off += 9;
++    }
++    wireStats.rawFrames++;
++    network.setRawTopology({ ids, tiers, flags, links, protoIdx }, rawProtoTable);
++}
++
++// Decode a binary position frame and feed the easing loop directly — no JSON,
++// no DataSet. Format (little-endian, must mirror buildPosFrame in
++// server/websocket.go): [u8 type=1][u16 count] then per node
++// [u16 idLen][id utf8][f32 x][f32 y].
++function applyPositionFrame(buf) {
++    // cosmos.gl mode: the GPU owns positions; server frames are irrelevant.
++    if (network && network.ownsLayout) return;
++    const dv = new DataView(buf);
++    if (dv.getUint8(0) !== 1) return; // unknown binary frame type
++    const count = dv.getUint16(1, true);
++    let off = 3;
++    let moved = false, snapped = false;
++    const bodyNodes = network ? network.body.nodes : {};
++    for (let i = 0; i < count; i++) {
++        const idLen = dv.getUint16(off, true); off += 2;
++        const id = wireTextDecoder.decode(new Uint8Array(buf, off, idLen)); off += idLen;
++        const x = dv.getFloat32(off, true); off += 4;
++        const y = dv.getFloat32(off, true); off += 4;
++        nodeTargetPos.set(id, { x: x, y: y });
++        const meta = nodeMeta.get(id);
++        if ((meta && meta.pinned) || !nodeRenderPos.has(id)) {
++            // Pinned nodes snap; a frame for a node we haven't drawn yet just
++            // seeds its spawn position (the style delta adding it may arrive a
++            // tick later, and will create it right here).
++            nodeRenderPos.set(id, { x: x, y: y });
++            const bn = bodyNodes[id];
++            if (bn && (bn.x !== x || bn.y !== y)) { bn.x = x; bn.y = y; snapped = true; }
++        } else {
++            moved = true;
++        }
++    }
++    wireStats.posFrames++;
++    wireStats.posNodes += count;
++    if (moved) startPositionAnimation();
++    else if (snapped && network) network.redraw();
++}
++
++// Merge a 1s counts frame into the meta maps (tooltips/details/search read
++// these) and refresh the stats bar + protocol legend. Never touches the
++// DataSet: counters don't change how anything is drawn.
++function applyCountsFrame(data) {
++    wireStats.countsFrames++;
++    if (data.nodes) {
++        for (const id in data.nodes) {
++            const meta = nodeMeta.get(id);
++            if (!meta) continue;
++            meta.packetCount = data.nodes[id][0];
++            meta.byteCount = data.nodes[id][1];
++        }
++    }
++    if (data.edges) {
++        for (const id in data.edges) {
++            const meta = edgeMeta.get(id);
++            if (!meta) continue;
++            const v = data.edges[id];
++            meta.packetCount = v[0];
++            meta.byteCount = v[1];
++            meta.forwardPackets = v[2];
++            meta.reversePackets = v[3];
++            meta.forwardBytes = v[4];
++            meta.reverseBytes = v[5];
++        }
++    }
++    if (data.stats) {
++        updateStatistics(data.stats.nodeCount, data.stats.edgeCount, data.stats.totalPackets);
++    }
++    if (data.protocolStats) updateProtocolCounts(data.protocolStats);
++}
++
+ // Helper function to update packet cache
+ // Packets are fetched on demand now (not pushed over the WebSocket). Poll the
+ // server for packets newer than our cursor and feed them into the same cache the
+@@ -2042,11 +2400,14 @@ function updatePacketCache(newPackets) {
+         }
+     });
+ 
+-    // Maintain cache size limit (keep most recent packets)
++    // Maintain cache size limit (keep most recent packets). Packets arrive in id
++    // order, so Map insertion order is oldest-first — no sort needed.
+     if (packetCache.size > MAX_CACHED_PACKETS) {
+-        const sortedIds = Array.from(packetCache.keys()).sort((a, b) => a - b);
+-        const toDelete = sortedIds.slice(0, packetCache.size - MAX_CACHED_PACKETS);
+-        toDelete.forEach(id => packetCache.delete(id));
++        let excess = packetCache.size - MAX_CACHED_PACKETS;
++        for (const id of packetCache.keys()) {
++            if (excess-- <= 0) break;
++            packetCache.delete(id);
++        }
+     }
+ 
+     // Update protocol dropdown with any new protocols
+@@ -2081,6 +2442,12 @@ function throttledUpdateGraph(data) {
+     // must NOT be coalesced: apply immediately and cancel any pending throttled
+     // delta, otherwise a delta arriving right after could overwrite the pending
+     // full and drop the nodes that full was adding (e.g. on a filter change).
++    // Chunked-full messages (partial) are likewise applied immediately — the
++    // throttle keeps only the newest pending delta, which would drop chunks.
++    if (data && data.partial && !data.isFull) {
++        updateGraph(data);
++        return;
++    }
+     if (data && data.isFull) {
+         if (updateTimer) { clearTimeout(updateTimer); updateTimer = null; }
+         updateScheduled = false;
+@@ -2091,7 +2458,7 @@ function throttledUpdateGraph(data) {
+     }
+ 
+     // Dynamic throttle based on current node count - keeps things responsive.
+-    const nodeCount = nodes.getIds().length;
++    const nodeCount = nodes.length;
+     if (nodeCount > 50) {
+         UPDATE_THROTTLE_MS = 200;  // 50+ nodes: update every 200ms
+     } else if (nodeCount > 25) {
+@@ -2134,6 +2501,14 @@ const GROUP_NODE_COLOR = {
+     highlight: { border: '#95a5a6', background: 'rgba(149, 165, 166, 0.35)' }
+ };
+ 
++// Collapsed /24 supernodes (Phase 4): blue boxes, visually distinct from both
++// hosts (dots) and multicast groups (grey dashed boxes).
++const SUBNET_NODE_COLOR = {
++    border: '#1d4ed8',
++    background: 'rgba(59, 130, 246, 0.35)',
++    highlight: { border: '#3b82f6', background: 'rgba(59, 130, 246, 0.55)' }
++};
++
+ // Map a server-computed traffic tier (0..3) to a theme-aware vis color object.
+ // The server decides the tier; the client only resolves the palette so theme
+ // toggling stays instant without a round-trip.
+@@ -2170,6 +2545,7 @@ function tierColor(tier, isLightTheme) {
+ // color (Phase D) wins; group nodes get the muted palette; otherwise the tier.
+ function viewNodeColor(node, isLightTheme) {
+     if (node.color) return node.color; // user override wins
++    if (node.isSubnet) return SUBNET_NODE_COLOR;
+     if (node.isGroup) return GROUP_NODE_COLOR;
+     if (nodeColorMode === 'role') return roleColor(node.role);
+     return tierColor(node.colorTier || 0, isLightTheme);
+@@ -2269,6 +2645,7 @@ function updateGraph(data) {
+     }
+     if (data.removedEdges && data.removedEdges.length > 0) {
+         edges.remove(data.removedEdges);
++        data.removedEdges.forEach(id => { edgeMeta.delete(id); lastEdgeSig.delete(id); });
+     }
+ 
+     // Build vis nodes from the server-styled ViewNodes. The server computes the
+@@ -2276,69 +2653,143 @@ function updateGraph(data) {
+     // ~10/s update rate), we record it as a target and let a 60fps animation loop
+     // ease the node toward it (see stepPositionAnimation). A brand-new node is
+     // placed at its target immediately so it doesn't fly in from the origin.
++    //
++    // Only items whose RENDER signature changed touch the DataSet: DataSet.update
++    // deep-merges, re-parses options and repaints per item, so count-only churn
++    // (the common case under traffic) must bypass it. Latest counts live in
++    // nodeMeta/edgeMeta for tooltips, details, and search.
+     let movedTargets = false;
+-    const nodeUpdates = incomingNodes.map(node => {
++    let snappedBody = false;
++    const bodyNodes = network ? network.body.nodes : {};
++    const nodeUpdates = [];
++    for (const node of incomingNodes) {
++        // Carry lazily-fetched detail (/api/node) across meta replacement —
++        // a style delta would otherwise wipe it and re-trigger fetches.
++        const prevMeta = nodeMeta.get(node.id);
++        if (prevMeta && prevMeta.detailLoaded) {
++            node.detailLoaded = true;
++            if (!node.ips || !node.ips.length) node.ips = prevMeta.ips;
++            if (!node.deviceInfo) node.deviceInfo = prevMeta.deviceInfo;
++            node.peers = prevMeta.peers;
++            node.detailEdges = prevMeta.detailEdges;
++        }
++        nodeMeta.set(node.id, node);
++
++        let renderPos = null;
++        if (typeof node.x === 'number' && typeof node.y === 'number' &&
++            network && network.ownsLayout) {
++            // cosmos.gl mode: the GPU sim owns positions. The server coordinate
++            // is only a spawn seed for brand-new nodes (the adapter ignores
++            // x/y updates for nodes it already simulates).
++            renderPos = { x: node.x, y: node.y };
++        } else if (typeof node.x === 'number' && typeof node.y === 'number') {
++            nodeTargetPos.set(node.id, { x: node.x, y: node.y });
++            if (node.pinned || !nodeRenderPos.has(node.id)) {
++                // New (or pinned) node: render at the target straight away. For an
++                // existing node the DataSet won't be touched below unless its style
++                // changed, so write the live vis node position directly.
++                nodeRenderPos.set(node.id, { x: node.x, y: node.y });
++                const bn = bodyNodes[node.id];
++                if (bn && (bn.x !== node.x || bn.y !== node.y)) {
++                    bn.x = node.x;
++                    bn.y = node.y;
++                    snappedBody = true;
++                }
++            } else {
++                movedTargets = true; // existing node will be eased by the loop
++            }
++            renderPos = nodeRenderPos.get(node.id);
++        }
++
++        const label = formatNodeLabel(node);
++        const shape = viewNodeShape(node);
++        const color = viewNodeColor(node, isLight);
++        // Quantize the size driver to ~5% steps: node size only spans 20..30px, so
++        // sub-5% growth is invisible and shouldn't trigger a restyle.
++        const valueQ = Math.round(Math.log((node.value || 0) + 1) * 20);
++        const sig = label + '~' + shape + '~' + valueQ + '~' + (node.isGroup ? 1 : 0) +
++            '~' + (node.role || '') + '~' + JSON.stringify(color);
++        if (lastNodeSig.get(node.id) === sig && nodes.get(node.id)) {
++            continue; // data-only change; meta map already updated
++        }
++        lastNodeSig.set(node.id, sig);
++
+         const nodeData = {
+             id: node.id,
+-            label: formatNodeLabel(node),
+-            title: formatNodeTooltip(node),
++            label: label,
+             ips: node.ips || [node.id],
+             hostname: node.label,
+             isGroup: node.isGroup,
++            isSubnet: node.isSubnet,
++            hostCount: node.hostCount,
+             role: node.role,
+-            icon: node.icon,
+-            deviceInfo: node.deviceInfo,
+             packetCount: node.packetCount,
+             byteCount: node.byteCount,
+             value: node.value,
+             colorTier: node.colorTier,
+-            shape: viewNodeShape(node),
+-            color: viewNodeColor(node, isLight),
++            shape: shape,
++            color: color,
+             shapeProperties: node.isGroup ? { borderDashes: [4, 4] } : { borderDashes: false },
+             font: node.isGroup ? { color: '#95a5a6' } : null
+         };
+-        if (typeof node.x === 'number' && typeof node.y === 'number') {
+-            nodeTargetPos.set(node.id, { x: node.x, y: node.y });
+-            if (node.pinned || !nodeRenderPos.has(node.id)) {
+-                // New (or pinned) node: render at the target straight away.
+-                nodeRenderPos.set(node.id, { x: node.x, y: node.y });
+-                nodeData.x = node.x;
+-                nodeData.y = node.y;
+-            } else {
+-                movedTargets = true; // existing node will be eased by the loop
+-            }
++        // Always carry the current RENDERED position so a style update re-applies
++        // the position the node is actually at (vis re-applies item x/y on update;
++        // a stale stored position would teleport the node).
++        if (renderPos) {
++            nodeData.x = renderPos.x;
++            nodeData.y = renderPos.y;
+         }
+-        return nodeData;
+-    });
++        nodeUpdates.push(nodeData);
++    }
+     if (nodeUpdates.length > 0) {
+         nodes.update(nodeUpdates);
+     }
+-    if (movedTargets) startPositionAnimation();
++    if (movedTargets) {
++        startPositionAnimation();
++    } else if (snappedBody && network) {
++        network.redraw();
++    }
+ 
+     // Build vis edges from server-styled ViewEdges. Hidden edges are already
+-    // omitted server-side, so there is no client-side protocol filtering.
+-    const edgeUpdates = incomingEdges.map(edge => ({
+-        id: edge.id,
+-        from: edge.from,
+-        to: edge.to,
+-        label: formatEdgeLabel(edge),
+-        title: formatEdgeTooltip(edge),
+-        color: { color: edge.protocol.Color },
+-        width: Math.log(edge.packetCount + 1) * 0.5 + 1,
+-        protocol: edge.protocol,
+-        packetCount: edge.packetCount,
+-        byteCount: edge.byteCount,
+-        forwardPackets: edge.forwardPackets,
+-        reversePackets: edge.reversePackets,
+-        forwardBytes: edge.forwardBytes,
+-        reverseBytes: edge.reverseBytes
+-    }));
++    // omitted server-side, so there is no client-side protocol filtering. Same
++    // signature scheme as nodes: width is quantized to 0.25px steps so packet
++    // churn on an existing edge almost never restyles it.
++    const edgeUpdates = [];
++    for (const edge of incomingEdges) {
++        edgeMeta.set(edge.id, edge);
++        const label = edgeLabelsVisible ? formatEdgeLabel(edge) : '';
++        const width = Math.round((Math.log(edge.packetCount + 1) * 0.5 + 1) * 4) / 4;
++        const sig = edge.from + '~' + edge.to + '~' + edge.protocol.Color + '~' + width + '~' + label;
++        if (lastEdgeSig.get(edge.id) === sig && edges.get(edge.id)) {
++            continue; // data-only change; meta map already updated
++        }
++        lastEdgeSig.set(edge.id, sig);
++        edgeUpdates.push({
++            id: edge.id,
++            from: edge.from,
++            to: edge.to,
++            label: label,
++            color: { color: edge.protocol.Color },
++            width: width,
++            protocol: edge.protocol,
++            packetCount: edge.packetCount,
++            byteCount: edge.byteCount
++        });
++    }
+     if (edgeUpdates.length > 0) {
+         edges.update(edgeUpdates);
+     }
+ 
+-    // On a full snapshot, drop anything the server no longer lists.
+-    if (isFull) {
++    // DataSet updates re-parse item options, which resets any focus dimming on the
++    // touched items — reapply it in one pass.
++    if (focusActive && (nodeUpdates.length > 0 || edgeUpdates.length > 0)) {
++        applyFocusDim();
++    }
++
++    // On a full snapshot, drop anything the server no longer lists. Chunked
++    // fulls (partial) skip this — later chunks carry the rest of the view, and
++    // the first chunk's explicit removedNodes/removedEdges are authoritative.
++    if (isFull && !data.partial) {
+         const keepNodes = new Set(incomingNodes.map(n => n.id));
+         const staleNodes = nodes.getIds().filter(id => !keepNodes.has(id));
+         if (staleNodes.length > 0) {
+@@ -2347,10 +2798,17 @@ function updateGraph(data) {
+         }
+         const keepEdges = new Set(incomingEdges.map(e => e.id));
+         const staleEdges = edges.getIds().filter(id => !keepEdges.has(id));
+-        if (staleEdges.length > 0) edges.remove(staleEdges);
++        if (staleEdges.length > 0) {
++            edges.remove(staleEdges);
++            staleEdges.forEach(id => { edgeMeta.delete(id); lastEdgeSig.delete(id); });
++        }
++
++    }
+ 
+-        // After a filter change, fit the camera to just the displayed nodes so
+-        // the view centers on what's shown, not the gaps left by hidden nodes.
++    // After a filter change, fit the camera to just the displayed nodes so
++    // the view centers on what's shown, not the gaps left by hidden nodes.
++    // (Outside the reconciliation block so chunked fulls fit too.)
++    if (isFull) {
+         if (fitOnNextFull && network && nodes.length > 0) {
+             network.fit({ animation: { duration: 400, easingFunction: 'easeInOutQuad' } });
+         }
+@@ -2362,19 +2820,35 @@ function updateGraph(data) {
+     // renders whatever is in subnetIslands.
+     if (data.subnetIslands) {
+         subnetIslands = data.subnetIslands;
+-        if (network) network.redraw();
++        if (network) {
++            if (network.invalidateOverlay) network.invalidateOverlay();
++            else network.redraw();
++        }
+     } else if (currentClusterLayout !== 'subnet' && subnetIslands.length > 0) {
+         subnetIslands = [];
+-        if (network) network.redraw();
++        if (network) {
++            if (network.invalidateOverlay) network.invalidateOverlay();
++            else network.redraw();
++        }
+     }
+ 
+     // Packets are still pushed in Phase A (moves to fetch-on-demand in Phase E).
+     updatePacketCache(data.packets);
+ 
+-    // Statistics from the live datasets (accurate for both delta and full).
+-    const allNodes = nodes.get();
+-    const totalPackets = allNodes.reduce((sum, n) => sum + (n.packetCount || 0), 0);
+-    updateStatistics(allNodes.length, edges.get().length, totalPackets);
++    // Statistics come from the server (computed on the view it just built);
++    // fall back to the meta maps — never a full DataSet copy — if absent.
++    if (data.stats) {
++        updateStatistics(data.stats.nodeCount, data.stats.edgeCount, data.stats.totalPackets);
++    } else {
++        let totalPackets = 0;
++        nodeMeta.forEach(n => { totalPackets += n.packetCount || 0; });
++        updateStatistics(nodes.length, edges.length, totalPackets);
++    }
++
++    // Re-apply tier-based quality options when the node count crosses a tier
++    // boundary (this used to happen only on theme change, so a growing graph
++    // kept full-quality settings forever).
++    maybeApplyPerformanceTier();
+ 
+     // Per-protocol breakdown in the legend/filters (includes hidden protocols).
+     if (data.protocolStats) updateProtocolCounts(data.protocolStats);
+@@ -2411,10 +2885,49 @@ function updateGraph(data) {
+     }
+ }
+ 
+-// Forget a removed node's interpolation state.
++// Drop every client-side per-item cache. Must accompany nodes.clear()/
++// edges.clear() (replay transitions) so no stale meta, signature, or
++// interpolation state survives into the new graph.
++function resetGraphCaches() {
++    nodeTargetPos.clear();
++    nodeRenderPos.clear();
++    nodeMeta.clear();
++    edgeMeta.clear();
++    lastNodeSig.clear();
++    lastEdgeSig.clear();
++}
++
++// Forget a removed node's interpolation state, meta and render signature.
+ function forgetNodePosition(id) {
+     nodeTargetPos.delete(id);
+     nodeRenderPos.delete(id);
++    nodeMeta.delete(id);
++    lastNodeSig.delete(id);
++}
++
++// Re-apply quality options when the node count crosses a performance-tier
++// boundary. setOptions is moderately expensive, so it runs only on crossings.
++function maybeApplyPerformanceTier() {
++    if (!network) return;
++    const tier = getPerformanceTier(nodes.length);
++    if (tier === currentTier) return;
++    currentTier = tier;
++    network.setOptions(getNetworkOptions());
++
++    // Edge label visibility follows the node count too: label text is the most
++    // expensive per-edge draw. Toggle by writing straight into the live edge
++    // options — vis silently ignores a DataSet update that sets an existing
++    // label to ''/null, so the DataSet route cannot clear rendered labels.
++    const show = nodes.length <= EDGE_LABEL_MAX_NODES;
++    if (show !== edgeLabelsVisible) {
++        edgeLabelsVisible = show;
++        const bodyEdges = network.body.edges;
++        for (const id in bodyEdges) {
++            const meta = edgeMeta.get(id);
++            bodyEdges[id].options.label = (show && meta) ? formatEdgeLabel(meta) : undefined;
++        }
++        network.redraw();
++    }
+ }
+ 
+ // Kick off the position-easing loop if it isn't already running.
+@@ -2425,30 +2938,37 @@ function startPositionAnimation() {
+ }
+ 
+ // One animation frame: ease every node's rendered position toward its server
+-// target and push the moved ones to the DataSet. Stops itself once everything is
+-// within half a pixel of its target, so an idle graph costs nothing.
++// target, writing straight into the live vis node objects and repainting once.
++// Never goes through the DataSet — DataSet.update deep-merges and re-parses every
++// item, which is what used to make this loop stutter at high node counts. Stops
++// itself once everything is within half a pixel of its target, so an idle graph
++// costs nothing; snaps instantly while the tab is hidden.
+ function stepPositionAnimation() {
+     if (!network) { positionAnimationActive = false; return; }
+-    const batch = [];
++    const bodyNodes = network.body.nodes;
++    const hidden = document.hidden;
+     let moving = false;
++    let moved = false;
+     nodeTargetPos.forEach((t, id) => {
+         let r = nodeRenderPos.get(id);
+         if (!r) { r = { x: t.x, y: t.y }; nodeRenderPos.set(id, r); }
+         const dx = t.x - r.x, dy = t.y - r.y;
+-        if ((dx * dx + dy * dy) < 0.25) {
++        if (hidden || (dx * dx + dy * dy) < 0.25) {
+             if (r.x !== t.x || r.y !== t.y) {
+                 r.x = t.x; r.y = t.y;
+-                batch.push({ id: id, x: t.x, y: t.y });
++                const bn = bodyNodes[id];
++                if (bn) { bn.x = t.x; bn.y = t.y; moved = true; }
+             }
+             return;
+         }
+         r.x += dx * POSITION_EASE;
+         r.y += dy * POSITION_EASE;
+-        batch.push({ id: id, x: r.x, y: r.y });
++        const bn = bodyNodes[id];
++        if (bn) { bn.x = r.x; bn.y = r.y; moved = true; }
+         moving = true;
+     });
+-    if (batch.length > 0) nodes.update(batch);
+-    if (moving) {
++    if (moved) network.redraw();
++    if (moving && !hidden) {
+         requestAnimationFrame(stepPositionAnimation);
+     } else {
+         positionAnimationActive = false;
+@@ -2463,14 +2983,9 @@ function focusNode(nodeId, pin) {
+     if (!network || !nodes.get(nodeId)) return;
+     focusPinned = pin;
+     focusActive = true;
+-    const keep = new Set([nodeId, ...network.getConnectedNodes(nodeId)]);
+-    const keepEdges = new Set(network.getConnectedEdges(nodeId));
+-
+-    nodes.update(nodes.getIds().map(id => ({ id: id, opacity: keep.has(id) ? 1 : 0.12 })));
+-    edges.update(edges.get().map(e => ({
+-        id: e.id,
+-        color: { color: (e.protocol && e.protocol.Color) || '#888', opacity: keepEdges.has(e.id) ? 1 : 0.06 }
+-    })));
++    focusKeepNodes = new Set([nodeId, ...network.getConnectedNodes(nodeId)]);
++    focusKeepEdges = new Set(network.getConnectedEdges(nodeId));
++    applyFocusDim();
+ }
+ 
+ // Restore full opacity to everything.
+@@ -2478,19 +2993,55 @@ function clearFocus() {
+     if (!focusActive) return;
+     focusActive = false;
+     focusPinned = false;
+-    nodes.update(nodes.getIds().map(id => ({ id: id, opacity: 1 })));
+-    edges.update(edges.get().map(e => ({
+-        id: e.id,
+-        color: { color: (e.protocol && e.protocol.Color) || '#888', opacity: 1 }
+-    })));
++    focusKeepNodes = null;
++    focusKeepEdges = null;
++    applyFocusDim();
++}
++
++// Write the dim state straight into the live vis node/edge options and repaint
++// once. The old DataSet-based version deep-merged and re-parsed every node and
++// edge on each hover, which alone could stall a busy graph.
++function applyFocusDim() {
++    if (!network) return;
++    const bodyNodes = network.body.nodes;
++    for (const id in bodyNodes) {
++        bodyNodes[id].options.opacity = (!focusActive || focusKeepNodes.has(id)) ? 1 : 0.12;
++    }
++    const bodyEdges = network.body.edges;
++    for (const id in bodyEdges) {
++        const opts = bodyEdges[id].options;
++        if (opts.color) {
++            opts.color.opacity = (!focusActive || focusKeepEdges.has(id)) ? 1 : 0.06;
++        }
++    }
++    network.redraw();
+ }
+ 
+ // --- Traffic flow particles ---------------------------------------------------
+ 
+ // Spawn particles for this tick's flows so traffic visibly moves along edges in
+ // its real direction. Only flows between currently-visible nodes are drawn.
++// The WebGL renderer draws particles inside its own scene (no 2D overlay, no
++// separate rAF loop — the Safari-friendly path); the 2D overlay below remains
++// as the vis-network fallback.
+ function feedFlowParticles(flows) {
+-    for (const f of flows) {
++    // cosmos.gl mode: positions live on the GPU; neither the GL particle scene
++    // nor the 2D overlay can follow them, so particles are off (v1).
++    if (network && network.ownsLayout) return;
++    // Gate on traffic volume: quiet flows spawn nothing (the graph should not
++    // be a snow globe), and speed encodes intensity.
++    const significant = flows.filter(f => (f.packets || 0) >= FLOW_MIN_PACKETS);
++    if (significant.length === 0) return;
++    if (network && typeof network.spawnParticles === 'function') {
++        network.spawnParticles(significant.map(f => ({
++            fromId: f.from,
++            toId: f.to,
++            color: f.color || PROTOCOL_COLORS[f.protocol] || '#7fd3ff',
++            speed: flowParticleSpeed(f.packets)
++        })));
++        return;
++    }
++    for (const f of significant) {
+         if (!nodes.get(f.from) || !nodes.get(f.to)) continue;
+         activeFlows.push({
+             edgeId: f.edgeId, // so the particle can follow the edge's actual curve
+@@ -2498,7 +3049,7 @@ function feedFlowParticles(flows) {
+             to: f.to,
+             color: f.color || PROTOCOL_COLORS[f.protocol] || '#7fd3ff',
+             progress: 0,
+-            speed: 0.018 + Math.random() * 0.012
++            speed: flowParticleSpeed(f.packets)
+         });
+     }
+     if (activeFlows.length > MAX_FLOW_PARTICLES) {
+@@ -2645,18 +3196,24 @@ function recolorAllNodes() {
+             isGroup: n.isGroup, colorTier: n.colorTier, role: n.role
+         }, isLight)
+     }));
+-    if (updates.length) nodes.update(updates);
++    if (updates.length) {
++        nodes.update(updates);
++        // Render signatures embed the computed color; drop them so the next delta
++        // re-syncs each node against the new palette instead of a stale signature.
++        lastNodeSig.clear();
++    }
+ }
+ 
+-// The shape for a node: groups stay a dashed box; every real (connected) node is
+-// a circle. Role is conveyed by color/legend, not shape.
++// The shape for a node: groups and collapsed subnets are boxes; every real
++// (connected) host is a circle. Role is conveyed by color/legend, not shape.
+ function viewNodeShape(node) {
+-    return node.isGroup ? 'box' : 'dot';
++    return (node.isGroup || node.isSubnet) ? 'box' : 'dot';
+ }
+ 
+ // Format node label. The role is encoded by node shape now, so the label stays
+ // clean (no glyph prefix); the glyph still appears in tooltips/details.
+ function formatNodeLabel(node) {
++    if (node.isSubnet) return `${node.label} (${node.hostCount})`;
+     return node.label !== node.id ? node.label : node.id;
+ }
+ 
+@@ -2664,6 +3221,15 @@ function formatNodeLabel(node) {
+ function formatNodeTooltip(node) {
+     let tooltip = '';
+ 
++    // Collapsed /24 supernode: summary + how to open it.
++    if (node.isSubnet) {
++        tooltip += `⬚ Collapsed subnet — ${node.hostCount} hosts\n`;
++        tooltip += `CIDR: ${node.label}\n`;
++        tooltip += `Packets: ${node.packetCount}\nBytes: ${formatBytes(node.byteCount)}\n`;
++        tooltip += `Click for details / expand`;
++        return tooltip;
++    }
++
+     // Flag multicast/broadcast rendezvous points so they aren't mistaken for a host
+     if (node.isGroup) {
+         tooltip += `⚲ Multicast/broadcast group (not a host)\n`;
+@@ -2702,9 +3268,11 @@ function formatNodeTooltip(node) {
+     return tooltip;
+ }
+ 
+-// Format edge label
++// Format edge label. Protocol name only: embedding the live packet count meant
++// every packet changed the label, forcing a text re-render of ~every edge on
++// every update under load. Counts live in the tooltip and details panel.
+ function formatEdgeLabel(edge) {
+-    return `${edge.protocol.Name} (${edge.packetCount})`;
++    return edge.protocol.Name;
+ }
+ 
+ // Format edge tooltip (bidirectional)
+@@ -2733,7 +3301,34 @@ function formatBytes(bytes) {
+ 
+ // Show node details
+ function showNodeDetails(nodeId) {
+-    const node = nodes.get(nodeId);
++    // Guard: vis DataSet.get(null) returns ALL items (an array), not null.
++    if (!nodeId || typeof nodeId !== 'string') return;
++    let node = nodes.get(nodeId);
++    if (!node || Array.isArray(node)) return;
++    // Merge live counts/fields from the meta map — the vis item only refreshes on
++    // visible style changes, so its counters may be stale.
++    const meta = nodeMeta.get(nodeId);
++    if (meta) {
++        node = Object.assign({}, node, {
++            packetCount: meta.packetCount,
++            byteCount: meta.byteCount,
++            role: meta.role,
++            deviceInfo: meta.deviceInfo,
++            ips: meta.ips || node.ips
++        });
++    }
++    // Slim stream: IPs/deviceInfo/connections come from /api/node on demand.
++    // Render what we have now, re-render once the detail arrives (unless the
++    // panel has moved on to another node meanwhile).
++    detailsNodeId = nodeId;
++    if (meta && !meta.detailLoaded && !node.isSubnet && !node.isGroup) {
++        fetchNodeDetail(nodeId).then(m => {
++            if (m && detailsNodeId === nodeId &&
++                document.getElementById('detailsPanel').classList.contains('active')) {
++                showNodeDetails(nodeId);
++            }
++        });
++    }
+     const connectedEdges = edges.get({
+         filter: edge => edge.from === nodeId || edge.to === nodeId
+     });
+@@ -2743,6 +3338,28 @@ function showNodeDetails(nodeId) {
+ 
+     detailsPanel.classList.add('active');
+ 
++    // Collapsed subnet supernode (Phase 4/5, /24 or /16): summary + expand,
++    // plus re-collapse of the parent /16 when viewing a /24 inside one.
++    if (node.isSubnet) {
++        const cidr = (node.hostname || nodeId).replace(/'/g, "\\'");
++        const parent16 = cidr.endsWith('/24') ? subnet16Of(cidr) : '';
++        const collapseParentHTML = (parent16 && expandedSubnets.has(parent16))
++            ? `<button class="group-toggle-btn" onclick="handleSubnetCollapse('${parent16}')">⊟ Collapse ${parent16}</button>`
++            : '';
++        detailsContent.innerHTML = `
++            <h4>Subnet Details</h4>
++            <div class="detail-item"><strong>CIDR:</strong> ${node.hostname || nodeId}</div>
++            <div class="detail-item"><strong>Hosts inside:</strong> ${node.hostCount || '?'}</div>
++            <div class="detail-item"><strong>Total Packets:</strong> ${node.packetCount || 0}</div>
++            <div class="detail-item"><strong>Total Bytes:</strong> ${formatBytes(node.byteCount || 0)}</div>
++            <div class="detail-item"><strong>Active Connections:</strong> ${connectedEdges.length}</div>
++            <div class="customize-buttons">
++                <button class="group-toggle-btn" onclick="handleSubnetExpand('${cidr}')">⊞ Expand subnet</button>
++                ${collapseParentHTML}
++            </div>`;
++        return;
++    }
++
+     // Format IP addresses
+     let ipAddressHTML = '';
+     if (node.ips && node.ips.length > 0) {
+@@ -2811,6 +3428,21 @@ function showNodeDetails(nodeId) {
+             </div>`;
+     }
+ 
++    // Phase 4/5: offer to re-collapse the subnets this host was expanded out of.
++    let subnetHTML = '';
++    if (!node.isGroup) {
++        const buttons = [];
++        for (const cidr of [hostSubnet24(node), subnet16Of(node)]) {
++            if (cidr && expandedSubnets.has(cidr)) {
++                buttons.push(`<button class="group-toggle-btn"
++                    onclick="handleSubnetCollapse('${cidr}')">⊟ Collapse ${cidr}</button>`);
++            }
++        }
++        if (buttons.length) {
++            subnetHTML = `<div class="detail-item">${buttons.join(' ')}</div>`;
++        }
++    }
++
+     detailsContent.innerHTML = `
+         <h4>Node Details</h4>
+         ${hostnameHTML}
+@@ -2819,6 +3451,7 @@ function showNodeDetails(nodeId) {
+         <div class="detail-item">
+             ${ipAddressHTML}
+         </div>
++        ${subnetHTML}
+         ${customizeHTML}
+         <div class="detail-item">
+             <strong>Total Packets:</strong> ${node.packetCount || 0}
+@@ -2844,7 +3477,17 @@ function showNodeDetails(nodeId) {
+ 
+ // Show edge details
+ function showEdgeDetails(edgeId) {
+-    const edge = edges.get(edgeId);
++    detailsNodeId = null;
++    let edge = edges.get(edgeId);
++    if (!edge) return;
++    // Live counts come from the meta map (vis item counters refresh lazily).
++    const meta = edgeMeta.get(edgeId);
++    if (meta) {
++        edge = Object.assign({}, edge, {
++            packetCount: meta.packetCount,
++            byteCount: meta.byteCount
++        });
++    }
+     const detailsPanel = document.getElementById('detailsPanel');
+     const detailsContent = document.getElementById('detailsContent');
+ 
+@@ -2874,6 +3517,7 @@ function showEdgeDetails(edgeId) {
+ 
+ // Hide details panel
+ function hideDetails() {
++    detailsNodeId = null;
+     const detailsPanel = document.getElementById('detailsPanel');
+     detailsPanel.classList.remove('active');
+     document.getElementById('detailsContent').innerHTML = '<p class="placeholder">Click on a node or edge to view details</p>';
+@@ -2936,9 +3580,11 @@ function setupTheme() {
+                 document.body.classList.remove('light-theme');
+             }
+ 
+-            // Update network with new theme-aware options
++            // Update network with new theme-aware options and restyle per-node
++            // colors (render signatures embed the theme-dependent color).
+             if (network) {
+                 network.setOptions(getNetworkOptions());
++                recolorAllNodes();
+             }
+         });
+     });
+@@ -3132,7 +3778,11 @@ function buildChimpyPath() {
+     console.log(`Chimpy: Found ${validEdges.length} valid edges to ride`);
+ 
+     // Sort edges by packet count (most active first) to make it interesting
+-    const sortedEdges = validEdges.sort((a, b) => b.packetCount - a.packetCount);
++    const sortedEdges = validEdges.sort((a, b) => {
++        const bp = (edgeMeta.get(b.id) || b).packetCount || 0;
++        const ap = (edgeMeta.get(a.id) || a).packetCount || 0;
++        return bp - ap;
++    });
+ 
+     // Take top edges and shuffle for variety
+     const topEdges = sortedEdges.slice(0, Math.min(20, sortedEdges.length));
+@@ -3291,6 +3941,12 @@ function updateChimpyPacketInfo(edge) {
+ 
+     if (!edge) return;
+ 
++    // Live counts come from the meta map (vis item counters refresh lazily).
++    const em = edgeMeta.get(edge.id);
++    if (em) {
++        edge = Object.assign({}, edge, { packetCount: em.packetCount, byteCount: em.byteCount });
++    }
++
+     // Get the actual nodes to access their IP addresses
+     const fromNode = nodes.get(edge.from);
+     const toNode = nodes.get(edge.to);
+@@ -3514,6 +4170,7 @@ async function enterReplayMode(filename) {
+         // Clear current graph
+         nodes.clear();
+         edges.clear();
++        resetGraphCaches();
+         packets = [];
+ 
+         // Update UI
+@@ -3567,6 +4224,7 @@ function exitReplayMode() {
+     // Clear graph
+     nodes.clear();
+     edges.clear();
++    resetGraphCaches();
+     packets = [];
+ 
+     // Update UI
+@@ -5501,7 +6159,7 @@ function createNodeSpheres() {
+         const orbitTilt = (seededRandom(node.id, 'tilt') - 0.5) * 0.4; // Slight orbital plane tilt
+ 
+         // Size based on packet count - MASSIVE planets (10x original)
+-        const packetCount = extractPacketCount(node.title) || 1;
++        const packetCount = metaPacketCount(node) || 1;
+         const baseSize = 1500;  // Minimum planet size
+         const maxSize = 6000;   // Maximum planet size
+         const size = Math.min(maxSize, baseSize + Math.log10(packetCount + 1) * 1200);
+@@ -5708,7 +6366,7 @@ function createNodeSpheres() {
+         gameMode.nodeDataMap.set(planetGroup.uuid, {
+             id: node.id,
+             label: node.label,
+-            title: node.title,
++            title: nodeTooltipFor(node.id),
+             packetCount: packetCount,
+             orbitRadius: orbitRadius,
+             orbitAngle: angle,
+@@ -6297,8 +6955,9 @@ function updateWarpSearch(query) {
+             });
+         }
+ 
+-        // Check title for additional data
+-        if (node.title && node.title.toLowerCase().includes(queryLower)) {
++        // Check tooltip data (built on demand from the meta map)
++        const nodeTitle = nodeTooltipFor(node.id);
++        if (nodeTitle && nodeTitle.toLowerCase().includes(queryLower)) {
+             nodeMatches.push({ type: 'Data', value: 'Packet data match' });
+         }
+ 
+@@ -6378,7 +7037,7 @@ function updateWarpSearch(query) {
+     // Render results
+     results.innerHTML = gameMode.warpResults.map((result, index) => {
+         const node = result.node;
+-        const packetCount = extractPacketCount(node.title) || 0;
++        const packetCount = metaPacketCount(node) || 0;
+         const matchText = result.matches.map(m => `${m.type}: ${m.value}`).join(' | ');
+ 
+         return `
+@@ -6579,7 +7238,7 @@ function completeWarp(targetMesh, targetNode) {
+     const planetInfoScreen = document.getElementById('planetInfoScreen');
+     if (planetInfoScreen) {
+         planetInfoScreen.classList.add('show');
+-        const packetCount = extractPacketCount(targetNode.title) || 0;
++        const packetCount = metaPacketCount(targetNode) || 0;
+         planetInfoScreen.innerHTML = `
+             <h4>DESTINATION REACHED</h4>
+             <div class="info-item"><strong>ID:</strong> ${targetNode.id}</div>
+@@ -6635,8 +7294,7 @@ function handleWarpKeyDown(e) {
+ 
+ // Get node color based on traffic
+ function getNodeColor(node) {
+-    const title = node.title || '';
+-    const packets = extractPacketCount(title);
++    const packets = metaPacketCount(node);
+ 
+     // Color gradient based on traffic intensity
+     if (packets > 1000) return 0xff4444; // Red - high traffic
+@@ -7447,12 +8105,12 @@ function showNodeScanResult(data) {
+ 
+ // Update game HUD with current stats
+ function updateGameHUD() {
+-    const nodeCount = nodes.length || nodes.getIds().length;
++    const nodeCount = nodes.length;
+     let totalPackets = 0;
+ 
+-    // Sum packets from all nodes
+-    nodes.get().forEach(node => {
+-        totalPackets += extractPacketCount(node.title) || 0;
++    // Sum packets from the meta map (no DataSet copy)
++    nodeMeta.forEach(meta => {
++        totalPackets += meta.packetCount || 0;
+     });
+ 
+     document.getElementById('gameNodeCount').textContent = nodeCount;
+@@ -7528,9 +8186,9 @@ function refreshGameNodes() {
+         if (mesh) {
+             const data = gameMode.nodeDataMap.get(mesh.uuid);
+             if (data) {
+-                const packetCount = extractPacketCount(node.title) || 1;
++                const packetCount = metaPacketCount(node) || 1;
+                 data.packetCount = packetCount;
+-                data.title = node.title;
++                data.title = nodeTooltipFor(node.id);
+                 data.label = node.label;
+             }
+         }
+@@ -7567,7 +8225,7 @@ function addNewGameNodes(newNodes) {
+         const verticalOffset = (seededRandom(node.id, 'voff') - 0.5) * 8000;
+         const orbitTilt = (seededRandom(node.id, 'tilt') - 0.5) * 0.4;
+ 
+-        const packetCount = extractPacketCount(node.title) || 1;
++        const packetCount = metaPacketCount(node) || 1;
+         const baseSize = 1500;
+         const maxSize = 6000;
+         const size = Math.min(maxSize, baseSize + Math.log10(packetCount + 1) * 1200);
+@@ -7586,7 +8244,7 @@ function addNewGameNodes(newNodes) {
+         gameMode.nodeDataMap.set(planetGroup.uuid, {
+             id: node.id,
+             label: node.label,
+-            title: node.title,
++            title: nodeTooltipFor(node.id),
+             packetCount: packetCount,
+             orbitRadius: orbitRadius,
+             orbitAngle: angle,
+@@ -7713,3 +8371,247 @@ function createPlanetMesh(nodeId, size, planetType) {
+ 
+ // Start the application when DOM is ready
+ document.addEventListener('DOMContentLoaded', init);
++
++// ============================================================================
++// History + Timeline (SQLite persistence): browse stored capture sessions and
++// scrub/play through one. The server rebuilds the graph from time-bucketed
++// flow stats over a sliding window ending at the scrub position (setTimeline
++// control message), so the view morphs through time like the live view would
++// have looked. Hidden entirely unless the server runs with -db.
++
++const timeline = {
++    active: false,
++    captureId: 0,
++    first: 0,          // capture bounds, unix seconds
++    last: 0,
++    t: 0,              // current scrub position (unix seconds)
++    window: 60,        // sliding window (matches live decay)
++    step: 1,
++    points: [],        // overview series for the sparkline
++    playing: false,
++    playTimer: null,
++    lastSent: 0,
++    sendTimer: null,
++};
++
++async function initHistoryUI() {
++    // Probe the history API: 501 means the server runs without -db and the
++    // whole feature stays hidden.
++    let resp;
++    try {
++        resp = await fetch('/api/history/captures');
++    } catch (e) {
++        return;
++    }
++    if (!resp.ok) return;
++
++    const navItem = document.getElementById('historyNavItem');
++    if (navItem) navItem.style.display = '';
++
++    const toggle = document.getElementById('historyToggle');
++    const submenu = document.getElementById('historySubmenu');
++    if (toggle && submenu) {
++        toggle.addEventListener('click', function(e) {
++            e.stopPropagation();
++            // Same behavior as setupDropdowns' toggleSubmenu (not in scope here).
++            document.querySelectorAll('.nav-link').forEach(btn => {
++                if (btn !== toggle) btn.classList.remove('active');
++            });
++            document.querySelectorAll('.submenu').forEach(sub => {
++                if (sub !== submenu) sub.classList.remove('show');
++            });
++            toggle.classList.toggle('active');
++            submenu.classList.toggle('show');
++            if (submenu.classList.contains('show')) loadCaptureHistory();
++        });
++    }
++
++    const playBtn = document.getElementById('timelinePlayButton');
++    const exitBtn = document.getElementById('timelineExitButton');
++    const slider = document.getElementById('timelineSlider');
++    if (playBtn) playBtn.addEventListener('click', toggleTimelinePlay);
++    if (exitBtn) exitBtn.addEventListener('click', exitTimeline);
++    if (slider) slider.addEventListener('input', onTimelineSlider);
++    window.addEventListener('resize', () => {
++        if (timeline.active) drawTimelineSparkline();
++    });
++}
++
++async function loadCaptureHistory() {
++    const list = document.getElementById('historyList');
++    if (!list) return;
++    try {
++        const resp = await fetch('/api/history/captures');
++        const data = await resp.json();
++        const captures = (data.captures || []).filter(c => c.lastBucket > c.firstBucket);
++        if (!captures.length) {
++            list.innerHTML = '<div class="loading">No stored captures yet</div>';
++            return;
++        }
++        list.innerHTML = '';
++        captures.forEach(c => {
++            const item = document.createElement('div');
++            item.className = 'history-item';
++            const span = c.lastBucket - c.firstBucket;
++            const when = new Date(c.firstBucket * 1000).toLocaleString();
++            item.innerHTML =
++                `<div class="history-item-title"><span>${escapeHtml(c.source)}</span>` +
++                `<span class="history-item-kind">${escapeHtml(c.kind)}</span></div>` +
++                `<div class="history-item-meta">${when} · ${formatTimelineDuration(span)} · ` +
++                `${c.nodes} hosts · ${c.packets.toLocaleString()} pkts</div>`;
++            item.addEventListener('click', () => enterTimeline(c));
++            list.appendChild(item);
++        });
++    } catch (e) {
++        list.innerHTML = '<div class="loading">Failed to load captures</div>';
++    }
++}
++
++async function enterTimeline(capture) {
++    // Overview resolution: aim for ~300 sparkline buckets across the capture.
++    const span = Math.max(1, capture.lastBucket - capture.firstBucket);
++    const step = Math.max(1, Math.ceil(span / 300));
++    let d;
++    try {
++        const resp = await fetch(`/api/timeline?capture=${capture.id}&step=${step}`);
++        d = await resp.json();
++    } catch (e) {
++        return;
++    }
++    if (!d.points || !d.points.length) return;
++
++    stopTimelinePlay();
++    timeline.active = true;
++    timeline.captureId = d.captureId;
++    timeline.first = d.first;
++    timeline.last = d.last + 1; // scrub end = after the final bucket
++    timeline.step = d.step;
++    timeline.points = d.points;
++    timeline.t = timeline.last;
++
++    const bar = document.getElementById('timelineBar');
++    if (bar) bar.style.display = '';
++    const slider = document.getElementById('timelineSlider');
++    if (slider) slider.value = 1000;
++    drawTimelineSparkline();
++    updateTimelineLabel();
++    sendTimelinePosition(true);
++}
++
++function exitTimeline() {
++    if (!timeline.active) return;
++    stopTimelinePlay();
++    timeline.active = false;
++    timeline.captureId = 0;
++    const bar = document.getElementById('timelineBar');
++    if (bar) bar.style.display = 'none';
++    sendControl({ type: 'setTimeline', data: { captureId: 0 } });
++}
++
++function onTimelineSlider() {
++    if (!timeline.active) return;
++    stopTimelinePlay();
++    const slider = document.getElementById('timelineSlider');
++    const frac = Number(slider.value) / Number(slider.max);
++    timeline.t = Math.round(timeline.first + frac * (timeline.last - timeline.first));
++    updateTimelineLabel();
++    sendTimelinePosition(false);
++}
++
++function toggleTimelinePlay() {
++    if (!timeline.active) return;
++    if (timeline.playing) {
++        stopTimelinePlay();
++        return;
++    }
++    // Play traverses the whole capture in ~60s of wall time (min 1s of capture
++    // per tick), restarting from the beginning when already at the end.
++    if (timeline.t >= timeline.last) timeline.t = timeline.first;
++    timeline.playing = true;
++    setTimelinePlayIcon(true);
++    const advance = Math.max(1, Math.round((timeline.last - timeline.first) / 240));
++    timeline.playTimer = setInterval(() => {
++        timeline.t = Math.min(timeline.last, timeline.t + advance);
++        syncTimelineSlider();
++        updateTimelineLabel();
++        sendTimelinePosition(false);
++        if (timeline.t >= timeline.last) stopTimelinePlay();
++    }, 250);
++}
++
++function stopTimelinePlay() {
++    if (timeline.playTimer) clearInterval(timeline.playTimer);
++    timeline.playTimer = null;
++    timeline.playing = false;
++    setTimelinePlayIcon(false);
++}
++
++function setTimelinePlayIcon(playing) {
++    const play = document.getElementById('timelinePlayIcon');
++    const pause = document.getElementById('timelinePauseIcon');
++    if (play) play.style.display = playing ? 'none' : '';
++    if (pause) pause.style.display = playing ? '' : 'none';
++}
++
++function syncTimelineSlider() {
++    const slider = document.getElementById('timelineSlider');
++    if (!slider) return;
++    const span = timeline.last - timeline.first;
++    slider.value = span > 0 ? Math.round((timeline.t - timeline.first) / span * Number(slider.max)) : 0;
++}
++
++function updateTimelineLabel() {
++    const label = document.getElementById('timelineLabel');
++    if (label) label.textContent = new Date(timeline.t * 1000).toLocaleTimeString();
++}
++
++// Throttle scrub positions to one control message per 150ms; the server also
++// coalesces (it only rebuilds when the quantized position changed).
++function sendTimelinePosition(immediate) {
++    const send = () => {
++        timeline.lastSent = Date.now();
++        sendControl({
++            type: 'setTimeline',
++            data: { captureId: timeline.captureId, t: timeline.t, window: timeline.window },
++        });
++    };
++    const elapsed = Date.now() - timeline.lastSent;
++    clearTimeout(timeline.sendTimer);
++    if (immediate || elapsed >= 150) {
++        send();
++    } else {
++        timeline.sendTimer = setTimeout(send, 150 - elapsed);
++    }
++}
++
++function drawTimelineSparkline() {
++    const canvas = document.getElementById('timelineSparkline');
++    if (!canvas || !timeline.points.length) return;
++    const dpr = window.devicePixelRatio || 1;
++    const w = canvas.clientWidth, h = canvas.clientHeight;
++    canvas.width = Math.max(1, Math.round(w * dpr));
++    canvas.height = Math.max(1, Math.round(h * dpr));
++    const ctx = canvas.getContext('2d');
++    ctx.scale(dpr, dpr);
++    ctx.clearRect(0, 0, w, h);
++    const span = Math.max(1, timeline.last - timeline.first);
++    let maxP = 0;
++    timeline.points.forEach(p => { if (p.packets > maxP) maxP = p.packets; });
++    if (maxP === 0) return;
++    const barW = Math.max(1, (timeline.step / span) * w - 0.5);
++    ctx.fillStyle = getComputedStyle(document.documentElement)
++        .getPropertyValue('--accent-primary').trim() || '#3498db';
++    timeline.points.forEach(p => {
++        const x = ((p.t - timeline.first) / span) * w;
++        const bh = Math.max(1, (p.packets / maxP) * (h - 2));
++        ctx.fillRect(x, h - bh, barW, bh);
++    });
++}
++
++function formatTimelineDuration(sec) {
++    if (sec >= 3600) return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
++    if (sec >= 60) return `${Math.floor(sec / 60)}m ${sec % 60}s`;
++    return `${sec}s`;
++}
++
++document.addEventListener('DOMContentLoaded', initHistoryUI);

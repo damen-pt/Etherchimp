@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"go-etherape/capture"
-	"go-etherape/graph"
+	"etherchimp/capture"
+	"etherchimp/graph"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcap"
@@ -89,6 +89,29 @@ func GetPcapFiles(pcapDir string) ([]PcapInfo, error) {
 	return pcapInfos, nil
 }
 
+// GetFileInfo returns metadata for a single pcap file (the same scan used for
+// directory listings).
+func GetFileInfo(path string) (PcapInfo, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return PcapInfo{}, err
+	}
+	metadata, err := scanPcapMetadata(path)
+	if err != nil {
+		return PcapInfo{}, err
+	}
+	return PcapInfo{
+		Filename:    filepath.Base(path),
+		Path:        path,
+		StartTime:   metadata.StartTime,
+		EndTime:     metadata.EndTime,
+		PacketCount: metadata.PacketCount,
+		FileSize:    fi.Size(),
+		ModTime:     fi.ModTime(),
+		DurationSec: metadata.EndTime.Sub(metadata.StartTime).Seconds(),
+	}, nil
+}
+
 // scanPcapMetadata does a quick scan to get timestamps and packet count
 func scanPcapMetadata(filename string) (PcapInfo, error) {
 	handle, err := pcap.OpenOffline(filename)
@@ -121,9 +144,22 @@ func scanPcapMetadata(filename string) (PcapInfo, error) {
 
 // NewReader creates a new pcap replay reader
 func NewReader(filename string) (*Reader, error) {
+	return NewReaderFiltered(filename, "")
+}
+
+// NewReaderFiltered is NewReader with an optional libpcap BPF filter (e.g. the
+// -net subnet filter) applied before packets are loaded, so non-matching packets
+// never enter the graph.
+func NewReaderFiltered(filename, bpf string) (*Reader, error) {
 	handle, err := pcap.OpenOffline(filename)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open pcap file: %v", err)
+	}
+	if bpf != "" {
+		if err := handle.SetBPFFilter(bpf); err != nil {
+			handle.Close()
+			return nil, fmt.Errorf("failed to apply filter %q: %v", bpf, err)
+		}
 	}
 
 	reader := &Reader{
@@ -187,6 +223,127 @@ func (r *Reader) GetDuration() time.Duration {
 	return r.endTime.Sub(r.startTime)
 }
 
+// SearchMatch describes one packet matching a replay search query, with its
+// position in the capture so the client can jump the timeline to it.
+type SearchMatch struct {
+	Index     int     `json:"index"` // packet index in file order (0-based)
+	OffsetSec float64 `json:"offsetSec"`
+	Src       string  `json:"src"`
+	Dst       string  `json:"dst"`
+	SrcPort   uint16  `json:"srcPort"`
+	DstPort   uint16  `json:"dstPort"`
+	Protocol  string  `json:"protocol"`
+	Length    int     `json:"length"`
+	Field     string  `json:"field"`  // what matched: "host", "protocol", or "payload"
+	Preview   string  `json:"preview"` // context around a payload match, empty otherwise
+}
+
+// SearchPackets scans the whole capture for a case-insensitive substring match
+// on endpoint IPs/names, protocol name, or raw payload bytes, returning at most
+// maxResults matches in file order.
+func (r *Reader) SearchPackets(query string, maxResults int) []SearchMatch {
+	matches := make([]SearchMatch, 0)
+	if query == "" || maxResults <= 0 {
+		return matches
+	}
+	queryLower := strings.ToLower(query)
+	queryBytes := []byte(queryLower)
+	dnsCache := make(map[string]string) // lazily resolved, shared with resolveIPSync
+
+	for i, pwt := range r.packets {
+		if len(matches) >= maxResults {
+			break
+		}
+		pkt := pwt.Info
+		m := SearchMatch{
+			Index:     i,
+			OffsetSec: pwt.Timestamp.Sub(r.startTime).Seconds(),
+			Src:       pkt.SrcIP,
+			Dst:       pkt.DstIP,
+			SrcPort:   pkt.SrcPort,
+			DstPort:   pkt.DstPort,
+			Protocol:  pkt.Protocol.Name,
+			Length:    pkt.Length,
+		}
+		switch {
+		case strings.Contains(strings.ToLower(pkt.SrcIP), queryLower),
+			strings.Contains(strings.ToLower(pkt.DstIP), queryLower),
+			pkt.SrcName != "" && strings.Contains(strings.ToLower(pkt.SrcName), queryLower),
+			pkt.DstName != "" && strings.Contains(strings.ToLower(pkt.DstName), queryLower):
+			m.Field = "host"
+		case strings.Contains(strings.ToLower(pkt.Protocol.Name), queryLower):
+			m.Field = "protocol"
+		default:
+			// Hostnames shown in the graph come from reverse DNS, so match
+			// against the resolved names too (cached per unique IP).
+			if strings.Contains(strings.ToLower(resolveIPSync(pkt.SrcIP, dnsCache)), queryLower) ||
+				strings.Contains(strings.ToLower(resolveIPSync(pkt.DstIP, dnsCache)), queryLower) {
+				m.Field = "host"
+				break
+			}
+			pos := payloadMatchPos(pkt.Payload, queryBytes)
+			if pos < 0 {
+				continue
+			}
+			m.Field = "payload"
+			m.Preview = payloadPreview(pkt.Payload, pos, len(queryBytes))
+		}
+		matches = append(matches, m)
+	}
+	return matches
+}
+
+// payloadMatchPos finds the first case-insensitive (ASCII) occurrence of
+// query in payload, or -1.
+func payloadMatchPos(payload, query []byte) int {
+	if len(query) == 0 || len(query) > len(payload) {
+		return -1
+	}
+	for i := 0; i+len(query) <= len(payload); i++ {
+		found := true
+		for j := 0; j < len(query); j++ {
+			b := payload[i+j]
+			if b >= 'A' && b <= 'Z' {
+				b += 32
+			}
+			if b != query[j] {
+				found = false
+				break
+			}
+		}
+		if found {
+			return i
+		}
+	}
+	return -1
+}
+
+// payloadPreview renders printable context around a payload match.
+func payloadPreview(payload []byte, matchPos, matchLen int) string {
+	start := matchPos - 20
+	if start < 0 {
+		start = 0
+	}
+	end := matchPos + matchLen + 20
+	if end > len(payload) {
+		end = len(payload)
+	}
+	var b strings.Builder
+	for i := start; i < end; i++ {
+		c := payload[i]
+		if c >= 32 && c <= 126 {
+			b.WriteByte(c)
+		} else {
+			b.WriteByte('.')
+		}
+	}
+	preview := b.String()
+	if len(preview) > 50 {
+		preview = preview[:47] + "..."
+	}
+	return preview
+}
+
 // Close closes the pcap handle
 func (r *Reader) Close() error {
 	if r.handle != nil {
@@ -195,13 +352,16 @@ func (r *Reader) Close() error {
 	return nil
 }
 
-// BuildSnapshotFromPackets creates a graph snapshot from a list of packets
-func BuildSnapshotFromPackets(packetsWithTime []PacketWithTime) graph.GraphSnapshot {
+// BuildSnapshotFromPackets creates a graph snapshot from a list of packets.
+// dnsCache memoizes reverse-DNS lookups; pass a shared cache (e.g. the replay
+// session's) so scrubbing many offsets doesn't re-resolve the same IPs.
+func BuildSnapshotFromPackets(packetsWithTime []PacketWithTime, dnsCache map[string]string) graph.GraphSnapshot {
 	// Create temporary graph manager for replay
 	tempGraph := graph.NewManager()
 
-	// Create DNS cache for synchronous lookups
-	dnsCache := make(map[string]string)
+	if dnsCache == nil {
+		dnsCache = make(map[string]string)
+	}
 
 	// Process each packet
 	for _, pwt := range packetsWithTime {
@@ -226,6 +386,9 @@ func BuildSnapshotFromPackets(packetsWithTime []PacketWithTime) graph.GraphSnaps
 		tempGraph.AddPacket(pkt)
 	}
 
+	// Commit role classifications so replay views style roles the same way the
+	// live view does (SnapshotRaw no longer commits them as a side effect).
+	tempGraph.CommitRoles()
 	return tempGraph.GetSnapshot()
 }
 

@@ -275,9 +275,10 @@ func SetupLogging(background bool) error {
 	// Redirect standard logger
 	log.SetOutput(logFd)
 
-	// Also redirect stdout/stderr
-	syscall.Dup2(int(logFd.Fd()), int(os.Stdout.Fd()))
-	syscall.Dup2(int(logFd.Fd()), int(os.Stderr.Fd()))
+	// Also redirect stdout/stderr (dupFD: dup3 on Linux, dup2 elsewhere —
+	// linux/arm64 has no dup2 syscall).
+	dupFD(int(logFd.Fd()), int(os.Stdout.Fd()))
+	dupFD(int(logFd.Fd()), int(os.Stderr.Fd()))
 
 	return nil
 }

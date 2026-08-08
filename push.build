@@ -1,0 +1,4 @@
+git add .github/workflows/release.yml
+git commit -m "el9 build: mark workspace git-safe for VCS stamping"
+git tag -f v0.1.2
+git push origin -f v0.1.2

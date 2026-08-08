@@ -753,6 +753,23 @@ body {
     color: var(--text-muted);
 }
 
+/* Inline autocomplete "ghost" text: overlays the input, showing the typed text
+   invisibly so the dimmed completion suffix lines up right after the caret. */
+.search-ghost {
+    position: absolute;
+    pointer-events: none;
+    white-space: pre;
+    overflow: hidden;
+    color: transparent;
+    font-size: 14px;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.search-ghost .ghost-suffix {
+    color: var(--text-muted);
+    opacity: 0.7;
+}
+
 .search-clear {
     background: transparent;
     border: none;
@@ -1246,11 +1263,12 @@ body {
     background: var(--bg-dropdown);
     padding: 15px;
     border-radius: 4px;
-    font-family: monospace;
+    font-family: 'Courier New', Courier, monospace;
     font-size: 12px;
     color: var(--text-primary);
     line-height: 1.6;
     overflow-x: auto;
+    white-space: pre;
     border: 1px solid var(--border-color);
 }
 
@@ -2061,6 +2079,22 @@ body.light-theme .chimpy-hex-dump {
     padding: 16px 20px;
     border-bottom: 1px solid var(--border-color);
     background: var(--bg-dropdown);
+    cursor: move;
+    user-select: none;
+    touch-action: none;
+}
+
+/* Drag/resize affordance: bottom-right corner handle */
+.stream-detail-resize {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: 18px;
+    height: 18px;
+    cursor: nwse-resize;
+    touch-action: none;
+    background: linear-gradient(135deg, transparent 50%, var(--border-color) 50%);
+    border-bottom-right-radius: 12px;
 }
 
 .stream-detail-title {
@@ -3733,4 +3767,175 @@ body.light-theme .chimpy-hex-dump {
     0% { background: rgba(255, 255, 255, 0); }
     30% { background: rgba(200, 255, 255, 0.8); }
     100% { background: rgba(255, 255, 255, 0); }
+}
+
+/* Lazy graph tooltip (replaces vis's built-in title tooltips; built on hover
+   from the client meta maps — see showGraphTooltipAt in app.js) */
+.graph-tooltip {
+    position: fixed;
+    z-index: 1000;
+    max-width: 340px;
+    padding: 8px 10px;
+    background: rgba(30, 39, 46, 0.95);
+    color: #ecf0f1;
+    border: 1px solid #34495e;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-line;
+    pointer-events: none;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+body.light-theme .graph-tooltip {
+    background: rgba(255, 255, 255, 0.97);
+    color: #2c3e50;
+    border-color: #bdc3c7;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+/* ============================================================
+   Timeline bar (scrub/play a stored capture — requires -db)
+   ============================================================ */
+.timeline-bar {
+    position: fixed;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 18px;
+    z-index: 900;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: min(720px, calc(100vw - 140px));
+    padding: 8px 12px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+}
+
+.timeline-button {
+    flex: 0 0 auto;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-dropdown);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.timeline-button:hover {
+    background: var(--accent-primary);
+    color: #fff;
+}
+
+.timeline-exit:hover {
+    background: var(--accent-danger);
+}
+
+.timeline-track {
+    position: relative;
+    flex: 1 1 auto;
+    height: 34px;
+}
+
+.timeline-sparkline {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0.75;
+    pointer-events: none;
+}
+
+.timeline-slider {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    cursor: pointer;
+}
+
+.timeline-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 4px;
+    height: 34px;
+    border-radius: 2px;
+    background: var(--accent-warning);
+    border: none;
+    box-shadow: 0 0 6px rgba(243, 156, 18, 0.8);
+}
+
+.timeline-slider::-moz-range-thumb {
+    width: 4px;
+    height: 34px;
+    border-radius: 2px;
+    background: var(--accent-warning);
+    border: none;
+    box-shadow: 0 0 6px rgba(243, 156, 18, 0.8);
+}
+
+.timeline-label {
+    flex: 0 0 auto;
+    min-width: 74px;
+    text-align: center;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+}
+
+/* History submenu: stored capture sessions */
+.history-list {
+    max-height: 260px;
+    overflow-y: auto;
+}
+
+.history-item {
+    padding: 8px 10px;
+    margin-bottom: 6px;
+    background: var(--bg-dropdown);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.history-item:hover {
+    background: var(--accent-primary);
+}
+
+.history-item:hover .history-item-meta {
+    color: rgba(255, 255, 255, 0.85);
+}
+
+.history-item-title {
+    font-size: 12px;
+    color: var(--text-primary);
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.history-item-kind {
+    text-transform: uppercase;
+    font-size: 10px;
+    color: var(--accent-warning);
+    letter-spacing: 0.5px;
+}
+
+.history-item-meta {
+    margin-top: 3px;
+    font-size: 11px;
+    color: var(--text-muted);
 }

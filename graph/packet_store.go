@@ -1,14 +1,17 @@
 package graph
 
 import (
-	"encoding/base64"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"go-etherape/capture"
+	"etherchimp/capture"
 )
 
-// PacketData represents a captured packet with payload
+// PacketData represents a captured packet with payload. Payload holds raw
+// bytes in memory; encoding/json marshals []byte as base64, so the wire
+// format is unchanged while ingest avoids a per-packet encode.
 type PacketData struct {
 	ID        int       `json:"id"`
 	Timestamp time.Time `json:"timestamp"`
@@ -18,9 +21,30 @@ type PacketData struct {
 	DstPort   uint16    `json:"dstPort"`
 	Protocol  string    `json:"protocol"`
 	Length    int       `json:"length"`
-	Payload   string    `json:"payload"` // Base64 encoded payload
+	Payload   []byte    `json:"payload"`
 	Summary   string    `json:"summary"`
 	VLANID    uint16    `json:"vlanId,omitempty"` // 802.1Q VLAN ID when tagged
+	// StreamID links the packet to its bidirectional stream (same key the
+	// stream package builds); empty when the packet has no ports.
+	StreamID string `json:"streamId,omitempty"`
+}
+
+// StreamKey builds the direction-normalized stream identifier for a packet,
+// e.g. "TCP-10.0.0.1:80-10.0.0.2:5555". Returns "" without both ports.
+func StreamKey(srcIP string, srcPort uint16, dstIP string, dstPort uint16, protocol string) string {
+	if srcPort == 0 || dstPort == 0 {
+		return ""
+	}
+	streamType := "TCP"
+	if protocol == "UDP" || protocol == "DNS" {
+		streamType = "UDP"
+	}
+	src := srcIP + ":" + strconv.Itoa(int(srcPort))
+	dst := dstIP + ":" + strconv.Itoa(int(dstPort))
+	if src > dst {
+		src, dst = dst, src
+	}
+	return streamType + "-" + src + "-" + dst
 }
 
 // PacketStore manages a sliding window of recent packets using a ring buffer
@@ -50,7 +74,8 @@ func (ps *PacketStore) AddPacket(pkt *capture.PacketInfo) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	// Create packet data with base64 encoded payload
+	// Create packet data; payload stays raw bytes (base64 happens at JSON
+	// encode time, and only for packets actually served).
 	packetData := PacketData{
 		ID:        ps.nextID,
 		Timestamp: time.Now(),
@@ -60,9 +85,10 @@ func (ps *PacketStore) AddPacket(pkt *capture.PacketInfo) {
 		DstPort:   pkt.DstPort,
 		Protocol:  pkt.Protocol.Name,
 		Length:    pkt.Length,
-		Payload:   base64.StdEncoding.EncodeToString(pkt.Payload),
+		Payload:   pkt.Payload,
 		Summary:   packetSummary(pkt),
 		VLANID:    pkt.VLANID,
+		StreamID:  StreamKey(pkt.SrcIP, pkt.SrcPort, pkt.DstIP, pkt.DstPort, pkt.Protocol.Name),
 	}
 
 	ps.nextID++
@@ -189,6 +215,142 @@ func (ps *PacketStore) GetPacketsBetween(setA, setB map[string]bool, sinceID, li
 		}
 	}
 	return result, cursor
+}
+
+// MostRecentForIPs returns the newest buffered packet whose src or dst IP is in
+// ipSet. The ring is stored oldest->newest, so we walk it from the tail.
+func (ps *PacketStore) MostRecentForIPs(ipSet map[string]bool) (PacketData, bool) {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	for i := ps.size - 1; i >= 0; i-- {
+		idx := (ps.head + i) % ps.maxPackets
+		p := ps.packets[idx]
+		if ipSet[p.SrcIP] || ipSet[p.DstIP] {
+			return p, true
+		}
+	}
+	return PacketData{}, false
+}
+
+// GetByID returns the buffered packet with the given ID, if still in the ring.
+func (ps *PacketStore) GetByID(id int) (PacketData, bool) {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	for i := ps.size - 1; i >= 0; i-- {
+		idx := (ps.head + i) % ps.maxPackets
+		if ps.packets[idx].ID == id {
+			return ps.packets[idx], true
+		}
+	}
+	return PacketData{}, false
+}
+
+// MostRecentContaining returns the newest buffered packet whose decoded payload
+// contains text (case-insensitive). Only the in-memory ring is searched, so
+// matches older than the buffer window are not found — full historic payload
+// search would require persisting payloads or pcap byte offsets (offsets are
+// currently never recorded).
+func (ps *PacketStore) MostRecentContaining(text string) (PacketData, bool) {
+	if text == "" {
+		return PacketData{}, false
+	}
+	lower := strings.ToLower(text)
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	for i := ps.size - 1; i >= 0; i-- {
+		idx := (ps.head + i) % ps.maxPackets
+		p := ps.packets[idx]
+		if payloadContains(p.Payload, lower) {
+			return p, true
+		}
+	}
+	return PacketData{}, false
+}
+
+// PayloadMatch is one packet matching a payload substring search.
+type PayloadMatch struct {
+	Packet PacketData `json:"packet"`
+	// Preview is printable context (±20 bytes) around the first match.
+	Preview string `json:"preview"`
+}
+
+// SearchPayload scans the ring (newest first) for a case-insensitive payload
+// substring, returning at most limit matches.
+func (ps *PacketStore) SearchPayload(text string, limit int) []PayloadMatch {
+	matches := make([]PayloadMatch, 0)
+	if text == "" || limit <= 0 {
+		return matches
+	}
+	lower := strings.ToLower(text)
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	for i := ps.size - 1; i >= 0 && len(matches) < limit; i-- {
+		idx := (ps.head + i) % ps.maxPackets
+		p := ps.packets[idx]
+		pos := payloadContainsAt(p.Payload, lower)
+		if pos < 0 {
+			continue
+		}
+		matches = append(matches, PayloadMatch{Packet: p, Preview: payloadPreview(p.Payload, pos, len(lower))})
+	}
+	return matches
+}
+
+// payloadContains reports whether payload contains lower (already-lowercased)
+// under ASCII case-insensitive comparison.
+func payloadContains(payload []byte, lower string) bool {
+	return payloadContainsAt(payload, lower) >= 0
+}
+
+// payloadContainsAt finds the first ASCII case-insensitive occurrence of lower
+// in payload, or -1.
+func payloadContainsAt(payload []byte, lower string) int {
+	if len(lower) == 0 || len(lower) > len(payload) {
+		return -1
+	}
+	for i := 0; i+len(lower) <= len(payload); i++ {
+		found := true
+		for j := 0; j < len(lower); j++ {
+			b := payload[i+j]
+			if b >= 'A' && b <= 'Z' {
+				b += 32
+			}
+			if b != lower[j] {
+				found = false
+				break
+			}
+		}
+		if found {
+			return i
+		}
+	}
+	return -1
+}
+
+// payloadPreview renders printable context around a match.
+func payloadPreview(payload []byte, matchPos, matchLen int) string {
+	start := matchPos - 20
+	if start < 0 {
+		start = 0
+	}
+	end := matchPos + matchLen + 20
+	if end > len(payload) {
+		end = len(payload)
+	}
+	var b strings.Builder
+	for i := start; i < end; i++ {
+		c := payload[i]
+		if c >= 32 && c <= 126 {
+			b.WriteByte(c)
+		} else {
+			b.WriteByte('.')
+		}
+	}
+	preview := b.String()
+	if len(preview) > 50 {
+		preview = preview[:47] + "..."
+	}
+	return preview
 }
 
 // GetRecentPackets returns the most recent N packets in chronological order

@@ -5,8 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>EtherChimp</title>
     <link rel="stylesheet" href="/static/styles.css">
-    <script src="https://unpkg.com/vis-network@9.1.6/dist/vis-network.min.js"></script>
-    <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+    <!-- Vendored locally (was unpkg CDN): no external fetch, works airgapped -->
+    <script src="/static/vendor/vis-network.min.js"></script>
+    <script src="/static/vendor/three.min.js"></script>
+    <script src="/static/vendor/cosmos-graph.min.js"></script>
+    <!-- Shared renderer helpers (color parsing) — must load before both renderers -->
+    <script src="/static/colorutil.js"></script>
+    <!-- WebGL graph renderer: the DEFAULT wherever WebGL2 is available;
+         vis-network remains the automatic fallback (?renderer=vis forces it) -->
+    <script src="/static/glrenderer.js"></script>
+    <!-- cosmos.gl renderer (opt-in via ?renderer=cosmos): GPU force layout in
+         the browser, for raw-scale views -->
+    <script src="/static/cosmosrenderer.js"></script>
 </head>
 <body>
     <script>
@@ -215,6 +225,17 @@
                                         <span>Clustered Subnet</span>
                                     </button>
                                 </div>
+                                <div class="theme-toggle" style="margin-top:8px;border-top:1px solid rgba(127,140,141,0.25);padding-top:8px;">
+                                    <button class="theme-button" id="mapModeBtn" title="WebGL ops map — force layout, particles, aggregation">
+                                        <span>Map (WebGL)</span>
+                                    </button>
+                                    <button class="theme-button" id="exploreModeBtn" title="Solar-system explorer — stable planets, names/IPs, click for packets">
+                                        <span>Explore (Solar)</span>
+                                    </button>
+                                </div>
+                                <button class="theme-button" data-cluster="solar" style="margin-top:4px;width:100%;" title="Server solar-system layout (works with either renderer)">
+                                    <span>Solar System layout</span>
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -257,6 +278,27 @@
                                 </svg>
                                 Download Current Pcap
                             </button>
+                        </div>
+                    </div>
+                </li>
+
+                <!-- History Section (SQLite persistence; hidden unless -db) -->
+                <li class="nav-item" data-tooltip="History" id="historyNavItem" style="display: none;">
+                    <button class="nav-link" id="historyToggle">
+                        <svg class="nav-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <polyline points="12 6 12 12 16 14"></polyline>
+                        </svg>
+                        <span class="nav-text">History</span>
+                        <svg class="nav-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M6 9l6 6 6-6"></path>
+                        </svg>
+                    </button>
+                    <div class="submenu" id="historySubmenu">
+                        <div class="replay-controls">
+                            <div class="history-list" id="historyList">
+                                <div class="loading">Loading captures...</div>
+                            </div>
                         </div>
                     </div>
                 </li>
@@ -359,9 +401,10 @@
                             type="text"
                             id="searchInput"
                             class="search-input"
-                            placeholder="Type [/] to search"
+                            placeholder="Type '/' to search"
                             autocomplete="off"
                         >
+                        <span class="search-ghost" id="searchGhost" aria-hidden="true"></span>
                         <button class="search-clear" id="searchClear" style="display: none;">&times;</button>
                     </div>
                     <div class="search-results" id="searchResults"></div>
@@ -375,6 +418,31 @@
                 </div>
             </div>
         </div>
+    </div>
+
+    <!-- Timeline Bar (scrub/play a stored capture; requires -db) -->
+    <div class="timeline-bar" id="timelineBar" style="display: none;">
+        <button class="timeline-button" id="timelinePlayButton" title="Play / pause">
+            <svg id="timelinePlayIcon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="6 4 20 12 6 20 6 4"></polygon>
+            </svg>
+            <svg id="timelinePauseIcon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="display:none;">
+                <rect x="5" y="4" width="4" height="16"></rect>
+                <rect x="15" y="4" width="4" height="16"></rect>
+            </svg>
+        </button>
+        <div class="timeline-track">
+            <canvas class="timeline-sparkline" id="timelineSparkline" height="34"></canvas>
+            <!-- id must stay distinct from the replay scrubber's #timelineSlider below -->
+            <input type="range" class="timeline-slider" id="historyTimelineSlider" min="0" max="1000" value="1000" step="1">
+        </div>
+        <span class="timeline-label" id="timelineLabel">--:--:--</span>
+        <button class="timeline-button timeline-exit" id="timelineExitButton" title="Back to live view">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18"></line>
+                <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+        </button>
     </div>
 
     <!-- Modal Backdrop -->
@@ -483,6 +551,7 @@
         <div class="stream-detail-content" id="streamDetailContent">
             <pre class="stream-content-pre" id="streamContentPre">Loading...</pre>
         </div>
+        <div class="stream-detail-resize" id="streamDetailResize"></div>
     </div>
 
     <!-- Chimpy Mode Elements -->

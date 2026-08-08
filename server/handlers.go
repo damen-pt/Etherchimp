@@ -10,9 +10,11 @@ import (
 	"strconv"
 	"strings"
 
-	"go-etherape/graph"
-	"go-etherape/replay"
-	"go-etherape/stream"
+	"etherchimp/capture"
+	"etherchimp/graph"
+	"etherchimp/replay"
+	"etherchimp/store"
+	"etherchimp/stream"
 )
 
 // Input validation constants
@@ -42,8 +44,125 @@ func (m *Manager) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Tell the client whether the -chimpy sidebar items are enabled, inline so
+	// the UI can gate them before first paint.
+	flagScript := fmt.Sprintf(`<script>window.ETHERCHIMP_CHIMPY = %t;</script></head>`, m.chimpyEnabled)
+	data = []byte(strings.Replace(string(data), "</head>", flagScript, 1))
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(data)
+}
+
+// handleNodeDetail serves the lazily-fetched full record for one node
+// (Phase 5): the fields stripped from the streamed ViewNode plus a connection
+// summary. GET /api/node?id=<nodeID>.
+func (m *Manager) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	detail, ok := m.graphMgr.GetNodeDetail(id)
+	if !ok {
+		http.Error(w, "node not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(detail)
+}
+
+// handleSearch serves server-side node search over the WHOLE graph (Phase 5),
+// so hosts hidden inside collapsed subnets or beyond the top-N view are still
+// findable. GET /api/search?q=<query>&limit=<n>.
+func (m *Manager) handleSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("q")
+	limit := parseIntParam(r, "limit", 20)
+	if limit > 100 {
+		limit = 100
+	}
+	// Try the Wireshark-subset display filter first; if the query isn't a
+	// structured filter (e.g. a bare "192"), fall back to substring search so
+	// existing behavior is preserved.
+	results, ok := m.graphMgr.SearchFilter(q, limit)
+	if !ok {
+		results = m.graphMgr.SearchNodes(q, limit)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
+}
+
+// handlePayloadSearch searches the live packet ring for a case-insensitive
+// payload substring, returning the newest matches with previews. Replaces the
+// old client-side base64 scan of the browser's packet cache.
+// GET /api/search/payload?q=<query>&limit=<n>.
+func (m *Manager) handlePayloadSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("q")
+	if q == "" {
+		http.Error(w, "missing query", http.StatusBadRequest)
+		return
+	}
+	limit := parseIntParam(r, "limit", 50)
+	if limit > 100 {
+		limit = 100
+	}
+	results := m.graphMgr.SearchPayload(q, limit)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
+}
+
+// handlePacketDetail returns preformatted payload views (hex dump, ASCII) for
+// one buffered packet, so the browser inspector renders them verbatim instead
+// of decoding/formatting base64 itself. GET /api/packet/detail?id=<n>.
+func (m *Manager) handlePacketDetail(w http.ResponseWriter, r *http.Request) {
+	id := parseIntParam(r, "id", 0)
+	if id <= 0 {
+		http.Error(w, "missing or invalid id", http.StatusBadRequest)
+		return
+	}
+	pkt, ok := m.graphMgr.PacketByID(id)
+	if !ok {
+		http.Error(w, "packet no longer in buffer", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":        pkt.ID,
+		"hexDump":   capture.HexDumpText(pkt.Payload, 512),
+		"asciiView": capture.ASCIIText(pkt.Payload, 2048),
+	})
+}
+
+// handleRecentPacket returns the single most-recent buffered packet (with
+// payload) for a node or for a payload-text match, so clicking a search result
+// opens the packet inspector on the latest relevant packet rather than only the
+// details sidebar. GET /api/packet/recent?node=<id> or ?contains=<text>.
+//
+// Note: only the in-memory ring is searched. Matches older than the buffer
+// window (e.g. text early in a large replay) are not found — full historic
+// payload search needs persisted payloads or pcap offsets, which aren't
+// currently recorded.
+func (m *Manager) handleRecentPacket(w http.ResponseWriter, r *http.Request) {
+	node := r.URL.Query().Get("node")
+	contains := r.URL.Query().Get("contains")
+	var (
+		pkt graph.PacketData
+		ok  bool
+	)
+	switch {
+	case contains != "":
+		pkt, ok = m.graphMgr.MostRecentPacketContaining(contains)
+	case node != "":
+		pkt, ok = m.graphMgr.MostRecentPacketForNode(node)
+	default:
+		http.Error(w, "missing node or contains", http.StatusBadRequest)
+		return
+	}
+	if !ok {
+		http.Error(w, "no matching packet in buffer", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(pkt)
 }
 
 // handleGraphAPI returns the current graph snapshot as JSON
@@ -233,58 +352,60 @@ func (m *Manager) handleReplayPcap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Construct safe path within pcaps directory
-	safePath := filepath.Join("pcaps", filename)
-
-	// Verify the file exists and is within the pcaps directory
-	absPath, err := filepath.Abs(safePath)
+	// Resolve the file inside pcaps/ (or the startup -f file)
+	safePath, err := m.resolvePcapPath(filename)
 	if err != nil {
-		http.Error(w, "Invalid file path", http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
 
-	pcapsDir, err := filepath.Abs("pcaps")
-	if err != nil {
-		http.Error(w, "Server configuration error", http.StatusInternalServerError)
-		return
+	// Pcap cache: when this exact file was fully ingested before (-db), rebuild
+	// the offset snapshot from stored flow buckets instead of re-parsing the
+	// file packet by packet.
+	if m.db.Enabled() {
+		if fm, err := store.ComputeFileMeta(safePath); err == nil {
+			if capID, ok := m.db.FindCompletePcap(filename, fm); ok {
+				if resp, ok := m.replayFromCache(capID, offsetSeconds); ok {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(resp)
+					return
+				}
+			}
+		}
 	}
 
-	if !strings.HasPrefix(absPath, pcapsDir+string(filepath.Separator)) {
-		http.Error(w, "Access denied", http.StatusForbidden)
-		return
-	}
-
-	// Open pcap file using the safe path
-	reader, err := replay.NewReader(safePath)
+	// Replay session: the file is parsed and laid out once, then cached. Every
+	// offset view reuses the FULL capture's converged positions, so scrubbing is
+	// a binary search plus a snapshot build — and nodes never move between
+	// offsets (new ones simply appear), which keeps the view stable.
+	session, err := m.replaySessionFor(safePath)
 	if err != nil {
 		http.Error(w, "Failed to open pcap file", http.StatusNotFound)
 		return
 	}
-	defer reader.Close()
+
+	session.mu.Lock()
+	defer session.mu.Unlock()
 
 	// Get packets up to the specified time
-	packetsWithTime := reader.GetPacketsUpToTime(offsetSeconds)
+	packetsWithTime := session.reader.GetPacketsUpToTime(offsetSeconds)
 
-	// Build graph snapshot from packets
-	snapshot := replay.BuildSnapshotFromPackets(packetsWithTime)
+	// Build graph snapshot from packets (shared DNS cache across offsets)
+	snapshot := replay.BuildSnapshotFromPackets(packetsWithTime, session.dnsCache)
 
-	// Style + lay out the snapshot server-side so replay renders identically to
-	// the live view (the client is a thin renderer with physics off). Replay is a
-	// static snapshot, so we run a throwaway force layout to convergence here.
-	raw := graph.RawSnapshot{Nodes: snapshot.Nodes, Edges: snapshot.Edges}
+	// Style the snapshot with the cached full-capture layout: every node in any
+	// offset view exists in the full capture, so all positions are known.
 	le := graph.NewLayoutEngine()
-	cfg := graph.ViewConfig{LayoutMode: "force"}
-	// Converge the layout before serving (BuildView also steps it once per call).
-	forceMode := map[string]bool{"force": true}
-	for i := 0; i < 80; i++ {
-		le.Step(raw, forceMode, nil, nil, nil)
-	}
-	view := graph.BuildView(raw, cfg, le, nil, nil, nil)
+	le.SeedPositions("force", session.positions)
+	view := graph.BuildView(graph.RawSnapshot{Nodes: snapshot.Nodes, Edges: snapshot.Edges},
+		graph.ViewConfig{LayoutMode: "force"}, le, nil, nil, nil)
 	resp := replayResponse{
-		Nodes:   view.Nodes,
-		Edges:   view.Edges,
-		Packets: snapshot.Packets,
-		IsFull:  true,
+		Nodes:    view.Nodes,
+		Edges:    view.Edges,
+		Packets:  snapshot.Packets,
+		IsFull:   true,
+		ValueMin: &session.valueMin,
+		ValueMax: &session.valueMax,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -300,6 +421,156 @@ type replayResponse struct {
 	Edges   []graph.ViewEdge   `json:"edges"`
 	Packets []graph.PacketData `json:"packets"`
 	IsFull  bool               `json:"isFull"`
+	// ValueMin/ValueMax are the FULL capture's node-value range, so the client
+	// can scale node sizes absolutely across the timeline (nil when unknown,
+	// e.g. the -db cache path — the client then uses per-view scaling).
+	ValueMin *float64 `json:"valueMin,omitempty"`
+	ValueMax *float64 `json:"valueMax,omitempty"`
+}
+
+// handleReplaySearch scans an entire pcap file for a query (endpoint IPs/names,
+// protocol, or payload bytes) and returns each match with its offset in
+// seconds, so the client can jump the replay timeline to it.
+// GET /api/replay/search?filename=<file>&q=<query>&limit=<n>.
+func (m *Manager) handleReplaySearch(w http.ResponseWriter, r *http.Request) {
+	filename, err := validateFilename(r.URL.Query().Get("filename"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		http.Error(w, "missing query", http.StatusBadRequest)
+		return
+	}
+	limit := parseIntParam(r, "limit", 50)
+	if limit > 100 {
+		limit = 100
+	}
+
+	// Resolve the file inside pcaps/ (or the startup -f file)
+	safePath, err := m.resolvePcapPath(filename)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	reader, err := replay.NewReader(safePath)
+	if err != nil {
+		http.Error(w, "Failed to open pcap file", http.StatusNotFound)
+		return
+	}
+	defer reader.Close()
+
+	results := reader.SearchPackets(query, limit)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
+}
+
+// resolvePcapPath maps a validated base filename to a servable pcap: a file in
+// the pcaps directory, or the startup -f replay file wherever it lives (a -f
+// path outside pcaps/ must still be scrubbable through the replay endpoints).
+func (m *Manager) resolvePcapPath(filename string) (string, error) {
+	safePath := filepath.Join("pcaps", filename)
+
+	// Verify the path stays within the pcaps directory
+	absPath, err := filepath.Abs(safePath)
+	if err != nil {
+		return "", fmt.Errorf("invalid file path")
+	}
+	pcapsDir, err := filepath.Abs("pcaps")
+	if err != nil {
+		return "", fmt.Errorf("server configuration error")
+	}
+	if !strings.HasPrefix(absPath, pcapsDir+string(filepath.Separator)) {
+		return "", fmt.Errorf("access denied")
+	}
+	if _, err := os.Stat(absPath); err == nil {
+		return safePath, nil
+	}
+
+	// Fall back to the startup -f file (matched by base name only, so the
+	// client never supplies — or learns — an arbitrary server path).
+	if m.replayFile != "" && filepath.Base(m.replayFile) == filename {
+		if _, err := os.Stat(m.replayFile); err == nil {
+			return m.replayFile, nil
+		}
+	}
+	return "", fmt.Errorf("pcap file not found")
+}
+
+// handleReplayInfo tells the client whether the server was started with -f
+// (replay-only), and if so which file — so the UI can auto-enter replay mode
+// with the timeline slider instead of rendering the static full-file graph as
+// if it were live. GET /api/replay/info.
+func (m *Manager) handleReplayInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if m.replayFile == "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{"active": false})
+		return
+	}
+	// When the -f file also lives in pcaps/, serve it under the pcaps/ path the
+	// replay file list uses, so client behavior is identical either way.
+	servedPath := m.replayFile
+	if _, err := os.Stat(filepath.Join("pcaps", filepath.Base(m.replayFile))); err == nil {
+		servedPath = filepath.Join("pcaps", filepath.Base(m.replayFile))
+	}
+	info, err := replay.GetFileInfo(servedPath)
+	if err != nil {
+		http.Error(w, "Failed to read replay file", http.StatusNotFound)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"active":      true,
+		"filename":    info.Filename,
+		"path":        info.Path,
+		"startTime":   info.StartTime,
+		"endTime":     info.EndTime,
+		"packetCount": info.PacketCount,
+		"durationSec": info.DurationSec,
+	})
+}
+
+// convergeReplayView styles and lays out a static (frozen) snapshot: replay has
+// no live ticking, so a throwaway force layout is run to convergence before
+// BuildView. Shared by the parse path and the pcap-cache path so both render
+// identically.
+func convergeReplayView(raw graph.RawSnapshot) graph.ViewSnapshot {
+	le := graph.NewLayoutEngine()
+	forceMode := map[string]bool{"force": true}
+	for i := 0; i < 80; i++ {
+		le.Step(raw, forceMode, nil, nil, nil)
+	}
+	return graph.BuildView(raw, graph.ViewConfig{LayoutMode: "force"}, le, nil, nil, nil)
+}
+
+// replayFromCache reconstructs the replay snapshot at offsetSeconds from the
+// stored flow buckets (cumulative from capture start — matching what parsing
+// the file up to that offset produces) and the persistent packet index. The
+// aggregates route through the same BulkLoad path the startup cache uses, so
+// hostname merging and styling match the cold path.
+func (m *Manager) replayFromCache(capID int64, offsetSeconds float64) (replayResponse, bool) {
+	_, first, _, err := m.db.TimelineOverview(capID, 1)
+	if err != nil || first == 0 {
+		return replayResponse{}, false
+	}
+	to := first + int64(offsetSeconds) + 1
+	storedNodes, storedEdges, err := m.db.WindowAggregates(capID, first, to)
+	if err != nil || len(storedNodes) == 0 {
+		return replayResponse{}, false
+	}
+	tmp := graph.NewManager()
+	tmp.BulkLoad(store.BulkNodes(storedNodes), store.BulkEdges(storedEdges))
+	tmp.CommitRoles()
+	view := convergeReplayView(tmp.SnapshotRaw())
+
+	var pkts []graph.PacketData
+	if rows, err := m.db.QueryPackets(capID, 0, to*1_000_000, "", 0, 1000); err == nil {
+		for _, p := range rows {
+			pkts = append(pkts, storePacketToData(p))
+		}
+	}
+	return replayResponse{Nodes: view.Nodes, Edges: view.Edges, Packets: pkts, IsFull: true}, true
 }
 
 // handleDownloadCurrentPcap returns the current live capture pcap file
@@ -319,6 +590,40 @@ func (m *Manager) handleDownloadCurrentPcap(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", currentFile.Filename))
 
 	http.ServeFile(w, r, currentFile.Path)
+}
+
+// protocolInfo is the per-protocol shape served to the frontend legend/filter
+// UI (lowercase keys, matching the protocols.json schema).
+type protocolInfo struct {
+	Name           string `json:"name"`
+	Color          string `json:"color"`
+	Layer          string `json:"layer"`
+	LayerNum       int    `json:"layerNum"`
+	Discovery      bool   `json:"discovery"`
+	DefaultVisible bool   `json:"defaultVisible"`
+}
+
+// handleProtocols returns the active protocol catalog (ordered legend list)
+// so the frontend builds its legend, layer grouping, and default filters from
+// the server instead of hardcoded tables.
+func (m *Manager) handleProtocols(w http.ResponseWriter, r *http.Request) {
+	all := capture.GetAllProtocols()
+	out := make([]protocolInfo, len(all))
+	for i, p := range all {
+		out[i] = protocolInfo{
+			Name:           p.Name,
+			Color:          p.Color,
+			Layer:          p.Layer,
+			LayerNum:       p.LayerNum,
+			Discovery:      p.Discovery,
+			DefaultVisible: p.DefaultVisible,
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(out); err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
 }
 
 // handleListStreams returns a list of all tracked streams

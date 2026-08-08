@@ -6,6 +6,17 @@ import (
 	"time"
 )
 
+// Sweep removal caps. Eligibility (age > threshold) is unchanged, but each
+// 10s sweep removes at most this many of the stalest nodes/edges. Without the
+// cap, everything from one burst (e.g. a 500-node port scan) hits the TTL at
+// the same moment and dies in a single tick — a mass-removal delta plus a
+// layout reheat, a delayed second freak-out long after the scan itself.
+// Staggered, a large corpse fades over a couple of minutes in gentle waves.
+const (
+	maxNodeRemovalsPerSweep = 50
+	maxEdgeRemovalsPerSweep = 100
+)
+
 // DecayManager handles time-based removal of stale nodes and edges
 type DecayManager struct {
 	graphMgr  *Manager
