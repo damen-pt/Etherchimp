@@ -1,0 +1,146 @@
+name: Release
+
+# Builds release tarballs for every push of a v* tag (e.g. v0.1.0) and
+# attaches them to a GitHub release for that tag.
+#
+# etherchimp uses cgo (go-sqlite3 bundles SQLite; gopacket links libpcap), so
+# each target is built on a runner of its own architecture instead of
+# cross-compiling — except darwin/amd64, which Apple clang can cross-target
+# from an arm64 runner. Linux runners need libpcap headers at build time;
+# Linux *users* need the libpcap runtime package (macOS ships it).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload assets
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-latest # cross-compiled with gcc -m32 + i386 libpcap
+            goos: linux
+            goarch: "386"
+          - runner: ubuntu-24.04-arm # hosted arm, free while the repo is public
+            goos: linux
+            goarch: arm64
+          - runner: macos-15 # Apple Silicon
+            goos: darwin
+            goarch: arm64
+          - runner: macos-15 # cross-target x86_64 via clang -arch
+            goos: darwin
+            goarch: amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install libpcap headers (Linux)
+        if: matrix.goos == 'linux' && matrix.goarch != '386'
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Install 32-bit toolchain and libpcap (linux/386)
+        if: matrix.goarch == '386'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib libpcap0.8-dev:i386
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          if [ "${{ matrix.goos }}" = "darwin" ] && [ "${{ matrix.goarch }}" = "amd64" ]; then
+            export CC="clang -arch x86_64"
+          elif [ "${{ matrix.goarch }}" = "386" ]; then
+            export CC="gcc -m32"
+          fi
+          go build -trimpath -ldflags "-s -w" -o etherchimp .
+
+      # The server serves static/index.html and /static/* from disk, so a
+      # release must ship the static tree alongside the binary.
+      - name: Package
+        run: |
+          pkg="etherchimp-${GITHUB_REF_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir "$pkg"
+          cp etherchimp "$pkg/"
+          cp -R static "$pkg/static"
+          tar czf "$pkg.tar.gz" "$pkg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: etherchimp-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: etherchimp-*.tar.gz
+
+  # RHEL/Fedora-family build. The matrix jobs above run on Ubuntu, so their
+  # binaries record libpcap's Debian SONAME (libpcap.so.0.8), which RHEL/Rocky/
+  # Fedora don't ship — those provide libpcap.so.1. Building inside a Rocky 9
+  # container makes -lpcap resolve against libpcap.so.1, so the artifact runs on
+  # el9 (RHEL/Rocky/Alma/Fedora 9.x+) out of the box. The runner is still
+  # Ubuntu; only these steps execute in the container. glibc 2.34 here means the
+  # binary needs el9-or-newer, not el8.
+  build-el9:
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    steps:
+      - name: Install build deps
+        # libpcap-devel lives in the CRB repo (CodeReady Builder), disabled by
+        # default on el9; enable it just for this install.
+        run: dnf install -y --enablerepo=crb gcc make tar gzip git libpcap-devel
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: amd64
+        # The checkout is owned by a different user than the container's, so
+        # git's dubious-ownership guard blocks go's VCS stamping (exit 128).
+        # Mark the workspace safe so the revision stamp still lands.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          go build -trimpath -ldflags "-s -w" -o etherchimp .
+
+      - name: Package
+        run: |
+          pkg="etherchimp-${GITHUB_REF_NAME}-linux-amd64-el9"
+          mkdir "$pkg"
+          cp etherchimp "$pkg/"
+          cp -R static "$pkg/static"
+          tar czf "$pkg.tar.gz" "$pkg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: etherchimp-linux-amd64-el9
+          path: etherchimp-*.tar.gz
+
+  release:
+    needs: [build, build-el9]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
