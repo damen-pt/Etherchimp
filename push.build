@@ -1,4 +1,114 @@
-git add .github/workflows/release.yml
-git commit -m "el9 build: mark workspace git-safe for VCS stamping"
-git tag -f v0.1.2
-git push origin -f v0.1.2
+#!/usr/bin/env bash
+# Cut the v0.1.2 release: commit the release workflow, move the tag onto that
+# commit, and push. Pushing a v* tag is what fires .github/workflows/release.yml,
+# which builds the cgo targets (libpcap + go-sqlite3) on native runners and
+# attaches the tarballs to the GitHub release for the tag.
+#
+# The tag already exists on origin from an earlier cut, so both the local tag
+# and the remote one are moved with -f. That is the point of the script: re-tag,
+# re-push, re-run the build.
+#
+#   ./push.build              # cut v0.1.2, prompting before the force-push
+#   ./push.build v0.1.3       # cut a different tag
+#   ./push.build -n           # dry run: print the git commands, change nothing
+#   ./push.build -y           # no prompt (for unattended use)
+
+set -euo pipefail
+
+TAG="v0.1.2"
+DRY_RUN=0
+ASSUME_YES=0
+WORKFLOW=".github/workflows/release.yml"
+COMMIT_MSG="el9 build: mark workspace git-safe for VCS stamping"
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-n | --dry-run) DRY_RUN=1 ;;
+	-y | --yes) ASSUME_YES=1 ;;
+	-h | --help)
+		sed -n '2,15p' "$0"
+		exit 0
+		;;
+	v*) TAG="$1" ;;
+	*)
+		echo "push.build: unknown argument '$1'" >&2
+		exit 2
+		;;
+	esac
+	shift
+done
+
+cd "$(dirname "$0")"
+
+# Run git, or just show it when --dry-run is set.
+run() {
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "+ $*"
+	else
+		echo "+ $*" >&2
+		"$@"
+	fi
+}
+
+git rev-parse --git-dir >/dev/null 2>&1 || {
+	echo "push.build: not a git repository" >&2
+	exit 1
+}
+
+[ -f "$WORKFLOW" ] || {
+	echo "push.build: $WORKFLOW is missing — nothing to release from" >&2
+	exit 1
+}
+
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+REMOTE="${REMOTE:-origin}"
+
+echo "repo:   $(git rev-parse --show-toplevel)"
+echo "remote: $REMOTE ($(git remote get-url "$REMOTE"))"
+echo "branch: $BRANCH"
+echo "tag:    $TAG (force-moved to the commit below)"
+echo
+
+run git add "$WORKFLOW"
+
+# A re-run with the workflow already committed has nothing to stage; that is a
+# normal case (re-triggering the build), not an error. Under --dry-run the add
+# above never ran, so ask git what *would* have been staged instead.
+if [ "$DRY_RUN" -eq 1 ]; then
+	pending="$(git status --porcelain -- "$WORKFLOW")"
+else
+	pending="$(git diff --cached --name-only)"
+fi
+
+if [ -n "$pending" ]; then
+	run git commit -m "$COMMIT_MSG"
+else
+	echo "nothing staged — reusing HEAD $(git log -1 --oneline)"
+fi
+
+if [ "$ASSUME_YES" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+	echo
+	echo "About to force-move $TAG onto $(git log -1 --format='%h %s') and"
+	echo "force-push it to $REMOTE. This replaces the existing remote $TAG and"
+	echo "re-runs the release build for it."
+	printf "continue? [y/N] "
+	read -r reply
+	case "$reply" in
+	y | Y | yes | YES) ;;
+	*)
+		echo "aborted — local tag and remote are untouched"
+		exit 1
+		;;
+	esac
+fi
+
+run git tag -f "$TAG"
+
+# Push the branch first so the tagged commit is reachable from main, then the
+# tag itself — the tag push is the event the workflow listens for.
+run git push "$REMOTE" "$BRANCH"
+run git push "$REMOTE" -f "$TAG"
+
+echo
+echo "pushed $TAG — watch the build:"
+echo "  gh run watch --repo damen-pt/Etherchimp"
